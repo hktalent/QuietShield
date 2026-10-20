@@ -68,7 +68,8 @@ header{padding:14px 0 10px;display:flex;align-items:center;justify-content:space
 .wave .w-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}
 .wave .w-h .nm{font-size:11px;color:var(--muted);font-weight:600}
 .wave .w-h .live-db{font-family:var(--mono);font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}
-canvas#scope{display:block;width:100%;height:50px;background:#080C10;border-radius:8px;border:1px solid var(--line)}
+/* 提升波形画布高度到80px */
+canvas#scope{display:block;width:100%;height:80px;background:#080C10;border-radius:8px;border:1px solid var(--line)}
 /* ===== 日志区 ===== */
 .zone{margin-top:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px}
 .zone .z-h{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px}
@@ -125,7 +126,6 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
         <h1>传感器监测台（权威矫正）</h1>
       </div>
     </div>
-    <span class="pill" id="securePill">—</span>
   </header>
   <section class="grid">
     <div class="card">
@@ -198,7 +198,6 @@ var wakeLockSentinel = null;
 var mediaRecorder = null;
 var recordedChunks = [];
 var micStream = null;
-
 // 请求屏幕常亮
 async function acquireWakeLock(){
   if(!("wakeLock" in navigator)){
@@ -242,7 +241,6 @@ var soundLive=false, motionLive=false;
 var magMode="compass";
 var magSensor=null;
 var magX=0, magY=0, magZ=0, magTotalUt=0;
-
 // ========== 超标会话状态机 ==========
 var overSession = {
   active: false,
@@ -259,7 +257,6 @@ function resetOverSession(){
   overSession.magSnap = "";
   overSession.vibSnap = 0;
 }
-
 // 格式化完整时间：YYYY‑MM‑DD HH:mm:ss
 function formatFullTime(timestampMs){
   const d = new Date(timestampMs);
@@ -271,7 +268,6 @@ function formatFullTime(timestampMs){
   const ss = ("0"+d.getSeconds()).slice(-2);
   return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }
-
 /* ---------- 存储 ---------- */
 function loadLog(){
   try{
@@ -286,7 +282,6 @@ function saveLog(){
   }
 }
 loadLog();
-
 // 开始录制音频片段（超标会话开启时调用）
 function startRecordAudio(){
   if(!micStream) return;
@@ -306,7 +301,6 @@ function startRecordAudio(){
     mediaRecorder = null;
   }
 }
-
 // 停止录制，返回base64音频字符串
 async function stopRecordAudio(){
   return new Promise((resolve)=>{
@@ -325,7 +319,6 @@ async function stopRecordAudio(){
     mediaRecorder.stop();
   });
 }
-
 /* ---------- 绘制工具 ---------- */
 function drawArc(canvas,frac,color){
   var dpr=window.devicePixelRatio||1;
@@ -353,26 +346,52 @@ function drawArc(canvas,frac,color){
     c.beginPath();c.arc(cx+Math.cos(a)*r,cy+Math.sin(a)*r,1.8,0,6.283);c.fill();
   });
 }
+
+// 【修复波形】增加动态自动增益放大波形振幅，噪声出现显示明显波峰
 function drawScope(){
-  var cv=$("scope");var dpr=window.devicePixelRatio||1;
+  var cv=$("scope");
+  var dpr=window.devicePixelRatio||1;
   var w=cv.clientWidth,h=cv.clientHeight;
   cv.width=w*dpr;cv.height=h*dpr;
   var c=cv.getContext("2d");
   c.setTransform(dpr,0,0,dpr,0,0);
-  c.fillStyle="#080C10";c.fillRect(0,0,w,h);
-  c.strokeStyle="#14202A";c.lineWidth=1;
+  c.fillStyle="#080C10";
+  c.fillRect(0,0,w,h);
+  c.strokeStyle="#14202A";
+  c.lineWidth=1;
   var mid=h/2;
-  c.beginPath();c.moveTo(0,mid);c.lineTo(w,mid);c.stroke();
+  c.beginPath();
+  c.moveTo(0,mid);
+  c.lineTo(w,mid);
+  c.stroke();
+
   if(!scopeBuf.length){return;}
-  c.strokeStyle="#22D3EE";c.lineWidth=1.6;
+
+  // 计算buffer最大振幅，动态增益
+  let maxAmp = 0;
+  for(let s of scopeBuf){
+    maxAmp = Math.max(maxAmp, Math.abs(s));
+  }
+  // 最小底增益，避免安静时波形完全消失；最大放大系数8倍
+  const minAmpFloor = 0.04;
+  // 8
+  let gain = Math.min(16, minAmpFloor / maxAmp || 1);
+
+  c.strokeStyle="#22D3EE";
+  c.lineWidth=1.6;
   c.beginPath();
   var n=scopeBuf.length;
   for(var i=0;i<n;i++){
-    var y=mid-scopeBuf[i]*mid*0.9;
-    if(i===0)c.moveTo(i*(w/(n-1)),y);else c.lineTo(i*(w/(n-1)),y);
+    // 使用动态增益缩放采样值
+    const scaled = scopeBuf[i] * gain;
+    var y=mid - scaled * mid * 0.92;
+    const x = i*(w/(n-1));
+    if(i===0) c.moveTo(x,y);
+    else c.lineTo(x,y);
   }
   c.stroke();
 }
+
 /* ---------- 麦克风 / 声压 ---------- */
 var audioCtx=null,analyser=null,micData=null;
 var scopeBuf=[];
@@ -385,8 +404,8 @@ function initAudio(){
     var src=audioCtx.createMediaStreamSource(stream);
     analyser=audioCtx.createAnalyser();
     analyser.fftSize=2048;
-    // 反应灵敏度：越靠近`0`：**响应极快，灵敏，但是噪声抖动大，读数跳的厉害；`0.35`属于中等平滑
-    analyser.smoothingTimeConstant=0.35;
+    // 降低平滑，保留瞬时尖峰
+    analyser.smoothingTimeConstant=0.12;
     src.connect(analyser);
     micData=new Uint8Array(analyser.fftSize);
     $("dSound").className="dot live";
@@ -405,11 +424,11 @@ function computeDb(){
   DB.value=db;
   S.sound=Math.max(0,Math.min(1,(db-20)/70));
   scopeBuf=[];
-  var step=Math.max(1,Math.floor(n/240));
+  // 修改采样步长，保留更多采样点，减少丢失尖峰
+  var step=Math.max(1,Math.floor(n/320));
   for(var k=0;k<n;k+=step){scopeBuf.push((micData[k]-128)/128);}
-  if(scopeBuf.length>300)scopeBuf=scopeBuf.slice(-300);
+  if(scopeBuf.length>400)scopeBuf=scopeBuf.slice(-400);
 }
-
 // 结束当前会话，写入日志（增加音频base64）
 async function closeAndSaveSession(){
   if(!overSession.active) return;
@@ -435,9 +454,14 @@ async function closeAndSaveSession(){
   }
   resetOverSession();
 }
-
+var avgZspj = 45;
 // 超标会话处理，每帧执行，使用实时thr
 function processOverThreshold(currentDb){
+  // alpha 0~1，越小越跟随新数据；0.08~0.15适合噪声背景
+  const alpha = 0.10;
+  if(!overSession.active){
+      avgZspj = avgZspj * (1-alpha) + currentDb * alpha;
+  }
   var nowTs=Date.now();
   var magSnapTxt = magMode==="magnetometer" ? (magTotalUt.toFixed(1)+" µT") : $("compass").textContent;
   if(currentDb > thr){
@@ -456,7 +480,7 @@ function processOverThreshold(currentDb){
     }
   }else{
     // 当前分贝小于实时阈值，关闭会话落盘
-    if(overSession.active){
+    if(overSession.active && currentDb<=avgZspj){
       closeAndSaveSession();
     }
   }
@@ -585,7 +609,6 @@ function renderLog(){
     b.appendChild(tr);
   }
 }
-
 // 导出完整HTML报告（内嵌波形图片base64 + audio播放标签）
 function exportHtmlReport(){
   if(!logArr.length){toast("暂无日志可导出");return;}
@@ -657,7 +680,6 @@ ${tableRows}
   a.remove();
   toast("已导出HTML报告，"+logArr.length+"条记录，含波形与噪声录音");
 }
-
 /* ---------- 主循环 ---------- */
 function start(){
   if(running)return;
@@ -690,7 +712,7 @@ async function stop(){
 function liveLoop(){
   if(!running)return;
   liveDb();
-  setTimeout(liveLoop,100);// 采集：20 次 / 秒
+  setTimeout(liveLoop,100);
 }
 /* ---------- 事件 ---------- */
 $("btnStart").addEventListener("click",async function(){
@@ -710,12 +732,6 @@ $("thr").addEventListener("input",function(){
 /* ---------- 安全上下文状态 ---------- */
 function setSecure(){
   var ok=window.isSecureContext===true;
-  var pill=$("securePill");
-  if(ok){
-    pill.textContent="受信 HTTPS";pill.className="pill on";
-  }else{
-    pill.textContent="非安全";pill.className="pill";
-  }
 }
 setSecure();
 function toast(msg){var t=$("toast");t.textContent=msg;t.className="toast show";clearTimeout(t._h);t._h=setTimeout(function(){t.className="toast";},2600);}
