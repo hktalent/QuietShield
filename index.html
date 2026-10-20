@@ -88,11 +88,11 @@ canvas#scope{display:block;width:100%;height:50px;background:#080C10;border-radi
 .btn[disabled]{opacity:.4;pointer-events:none}
 .log{max-height:260px;overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:8px}
 table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;table-layout:fixed}
-colgroup col.t{width:22%}
-colgroup col.dur{width:14%}
-colgroup col.d{width:16%}
-colgroup col.m{width:24%}
-colgroup col.v{width:24%}
+colgroup col.t{width:26%}
+colgroup col.dur{width:12%}
+colgroup col.d{width:14%}
+colgroup col.m{width:22%}
+colgroup col.v{width:26%}
 th,td{padding:6px 8px;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 thead th{position:sticky;top:0;background:#0E161D;color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);font-size:10px}
 tbody tr{border-bottom:1px solid #17222B}
@@ -131,7 +131,7 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
     <div class="card">
       <div class="h"><span class="nm">声压级</span><span class="dot" id="dSound"></span></div>
       <div class="gauge"><canvas id="gSound"></canvas></div>
-      <div class="gvalue"><span class="v" id="vSound">--.-</span><span class="u">dB</span></div>
+      <div class="gvalue"><span class="v" id="vSound">--</span><span class="u">dB</span></div>
       <div class="gstate" id="sSound">等待麦克风</div>
     </div>
     <div class="card">
@@ -191,12 +191,13 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
   </section>
 </div>
 <div class="toast" id="toast"></div>
-
 <script>
 (function(){
 "use strict";
-
 var wakeLockSentinel = null;
+var mediaRecorder = null;
+var recordedChunks = [];
+var micStream = null;
 
 // 请求屏幕常亮
 async function acquireWakeLock(){
@@ -220,7 +221,6 @@ async function acquireWakeLock(){
     wakeLockSentinel=null;
   }
 }
-
 // 释放屏幕常亮
 async function releaseWakeLock(){
   if(wakeLockSentinel){
@@ -229,7 +229,6 @@ async function releaseWakeLock(){
     toast("已关闭屏幕常亮");
   }
 }
-
 var $=function(id){return document.getElementById(id);};
 var S={sound:0,mag:0,vib:0};
 var DB={value:0};
@@ -252,7 +251,6 @@ var overSession = {
   magSnap: "",
   vibSnap: 0
 };
-
 // 重置会话全部状态
 function resetOverSession(){
   overSession.active = false;
@@ -260,6 +258,18 @@ function resetOverSession(){
   overSession.peakDb = 0;
   overSession.magSnap = "";
   overSession.vibSnap = 0;
+}
+
+// 格式化完整时间：YYYY‑MM‑DD HH:mm:ss
+function formatFullTime(timestampMs){
+  const d = new Date(timestampMs);
+  const y = d.getFullYear();
+  const m = ("0"+(d.getMonth()+1)).slice(-2);
+  const day = ("0"+d.getDate()).slice(-2);
+  const hh = ("0"+d.getHours()).slice(-2);
+  const mm = ("0"+d.getMinutes()).slice(-2);
+  const ss = ("0"+d.getSeconds()).slice(-2);
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }
 
 /* ---------- 存储 ---------- */
@@ -271,9 +281,50 @@ function loadLog(){
   renderLog();
 }
 function saveLog(){
-  try{localStorage.setItem("sm_log",JSON.stringify(logArr));}catch(e){}
+  try{localStorage.setItem("sm_log",JSON.stringify(logArr));}catch(e){
+    toast("⚠️本地存储已满，无法保存日志");
+  }
 }
 loadLog();
+
+// 开始录制音频片段（超标会话开启时调用）
+function startRecordAudio(){
+  if(!micStream) return;
+  try{
+    recordedChunks = [];
+    let options = { mimeType: "audio/webm" };
+    if(!MediaRecorder.isTypeSupported(options.mimeType)){
+      options = { mimeType: "" };
+    }
+    mediaRecorder = new MediaRecorder(micStream, options);
+    mediaRecorder.ondataavailable = function(e){
+      if(e.data.size>0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.start();
+  }catch(err){
+    console.warn("录音启动失败",err);
+    mediaRecorder = null;
+  }
+}
+
+// 停止录制，返回base64音频字符串
+async function stopRecordAudio(){
+  return new Promise((resolve)=>{
+    if(!mediaRecorder || mediaRecorder.state==="inactive"){
+      resolve(null);
+      return;
+    }
+    mediaRecorder.onstop = async ()=>{
+      const blob = new Blob(recordedChunks, {type:"audio/webm"});
+      const reader = new FileReader();
+      reader.onloadend = ()=>{
+        resolve(reader.result);
+      };
+      reader.readAsDataURL(blob);
+    };
+    mediaRecorder.stop();
+  });
+}
 
 /* ---------- 绘制工具 ---------- */
 function drawArc(canvas,frac,color){
@@ -322,7 +373,6 @@ function drawScope(){
   }
   c.stroke();
 }
-
 /* ---------- 麦克风 / 声压 ---------- */
 var audioCtx=null,analyser=null,micData=null;
 var scopeBuf=[];
@@ -330,10 +380,13 @@ function initAudio(){
   if(audioCtx)return Promise.resolve();
   return navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}})
   .then(function(stream){
+    micStream = stream;
     audioCtx=new (window.AudioContext||window.webkitAudioContext)();
     var src=audioCtx.createMediaStreamSource(stream);
     analyser=audioCtx.createAnalyser();
-    analyser.fftSize=2048;analyser.smoothingTimeConstant=0.35;
+    analyser.fftSize=2048;
+    // 反应灵敏度：越靠近`0`：**响应极快，灵敏，但是噪声抖动大，读数跳的厉害；`0.35`属于中等平滑
+    analyser.smoothingTimeConstant=0.35;
     src.connect(analyser);
     micData=new Uint8Array(analyser.fftSize);
     $("dSound").className="dot live";
@@ -357,26 +410,26 @@ function computeDb(){
   if(scopeBuf.length>300)scopeBuf=scopeBuf.slice(-300);
 }
 
-// 结束当前会话，写入日志
-function closeAndSaveSession(){
+// 结束当前会话，写入日志（增加音频base64）
+async function closeAndSaveSession(){
   if(!overSession.active) return;
   var nowTs=Date.now();
   var durSec = ((nowTs - overSession.startTs)/1000).toFixed(1);
+  let audioB64 = await stopRecordAudio();
   if(parseFloat(durSec)>=MIN_RECORD_SEC){
     var waveImgB64 = $("scope").toDataURL("image/png");
-    var tObj=new Date(overSession.startTs);
-    var hh=("0"+tObj.getHours()).slice(-2);
-    var mm=("0"+tObj.getMinutes()).slice(-2);
-    var ss=("0"+tObj.getSeconds()).slice(-2);
+    const fullTimeStr = formatFullTime(overSession.startTs);
     logArr.unshift({
-      time: hh+":"+mm+":"+ss,
+      timeText: fullTimeStr,
+      timeTs: overSession.startTs,
       durationSec: durSec,
       peakDb: overSession.peakDb.toFixed(1),
       mag: overSession.magSnap,
       vib: overSession.vibSnap.toFixed(2),
-      waveImg: waveImgB64
+      waveImg: waveImgB64,
+      audioData: audioB64
     });
-    if(logArr.length>500) logArr.length=500;
+    if(logArr.length>300) logArr.length=300;
     saveLog();
     renderLog();
   }
@@ -387,7 +440,6 @@ function closeAndSaveSession(){
 function processOverThreshold(currentDb){
   var nowTs=Date.now();
   var magSnapTxt = magMode==="magnetometer" ? (magTotalUt.toFixed(1)+" µT") : $("compass").textContent;
-
   if(currentDb > thr){
     // 当前分贝大于实时阈值，维持/开启会话
     if(!overSession.active){
@@ -396,6 +448,7 @@ function processOverThreshold(currentDb){
       overSession.peakDb = currentDb;
       overSession.magSnap = magSnapTxt;
       overSession.vibSnap = vibSmooth;
+      startRecordAudio();
     }else{
       if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
       overSession.vibSnap = vibSmooth;
@@ -408,13 +461,12 @@ function processOverThreshold(currentDb){
     }
   }
 }
-
 function liveDb(){
   if(!running||!soundLive)return;
   computeDb();
   var db=DB.value;
-  $("vSound").textContent=db.toFixed(1);
-  $("liveDb").textContent=db.toFixed(1)+" dB";
+  $("vSound").textContent=db.toFixed(0);
+  $("liveDb").textContent=db.toFixed(0)+" dB";
   drawArc($("gSound"),S.sound,db>thr?"#F5A623":"#22D3EE");
   var st=$("sSound");
   if(db>thr){st.textContent="超阈值!";st.className="gstate alarm";}
@@ -423,7 +475,6 @@ function liveDb(){
   drawScope();
   processOverThreshold(db);
 }
-
 /* ---------- 振动 ---------- */
 var acc={x:0,y:0,z:0};
 var vibSmooth=0;
@@ -456,7 +507,6 @@ function initMotion(){
     return null;
   });
 }
-
 /* ---------- 磁场 / 罗盘 ---------- */
 function onOrient(e){
   if(!running)return;
@@ -486,13 +536,11 @@ function initMagnetometer(){
       S.mag=Math.min(1, magTotalUt / 120);
       drawArc($("gMag"), S.mag,"#A78BFA");
       $("dMag").className="dot live";
-      $("sMag").textContent="磁强计在线(µT)";
     });
     magSensor.addEventListener("error",function(err){
       console.warn("Magnetometer异常，回退罗盘模式",err);
       magMode="compass";
       $("uMag").textContent="方向";
-      $("sMag").textContent="磁强计异常，仅罗盘";
       magSensor=null;
     });
     magSensor.start();
@@ -500,7 +548,6 @@ function initMagnetometer(){
     console.warn("初始化Magnetometer失败，回退罗盘",err);
     magMode="compass";
     $("uMag").textContent="方向";
-    $("sMag").textContent="不支持磁强计，仅罗盘";
     magSensor=null;
   }
 }
@@ -516,7 +563,6 @@ function initCompass(){
     window.addEventListener("deviceorientation",onOrient,false);
   }
 }
-
 /* ---------- 日志渲染 ---------- */
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
@@ -531,7 +577,7 @@ function renderLog(){
     var tr=document.createElement("tr");
     tr.className="alarm";
     tr.innerHTML=
-      '<td>'+r.time+'</td>'+
+      '<td>'+(r.timeText||"--")+'</td>'+
       '<td>'+(r.durationSec||"N/A")+'s</td>'+
       '<td>'+r.peakDb+'</td>'+
       '<td>'+r.mag+'</td>'+
@@ -540,21 +586,28 @@ function renderLog(){
   }
 }
 
-// 导出完整HTML报告（内嵌波形图片base64）
+// 导出完整HTML报告（内嵌波形图片base64 + audio播放标签）
 function exportHtmlReport(){
   if(!logArr.length){toast("暂无日志可导出");return;}
   var reportTitle="传感器声‑磁‑振监测报告 "+new Date().toLocaleString();
   var tableRows="";
   for(var i=0;i<logArr.length;i++){
     var rec=logArr[i];
+    let audioHtml = "";
+    if(rec.audioData){
+      audioHtml = `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${rec.audioData}" type="audio/webm">你的浏览器不支持播放该音频`;
+    }else{
+      audioHtml = `<span style="color:#888">无录音片段</span>`;
+    }
     tableRows += `
 <tr style="border-bottom:#ccc 1px solid;">
-  <td style="padding:6px 8px">${rec.time}</td>
+  <td style="padding:6px 8px">${rec.timeText}</td>
   <td style="padding:6px 8px">${rec.durationSec||"N/A"} s</td>
   <td style="padding:6px 8px">${rec.peakDb} dB</td>
   <td style="padding:6px 8px">${rec.mag}</td>
   <td style="padding:6px 8px">${rec.vib} m/s²</td>
-  <td style="padding:4px;"><img src="${rec.waveImg}" style="width:320px;border:1px solid #666;"></td>
+  <td style="padding:4px;">${audioHtml}</td>
+  <td style="padding:4px;"><img src="${rec.waveImg}" style="width:280px;border:1px solid #666;"></td>
 </tr>
 `;
   }
@@ -571,6 +624,7 @@ table{border-collapse:collapse;width:100%;font-size:12px;}
 th{background:#222;color:#fff;padding:8px;text-align:left;}
 td{background:#fff;}
 img{max-width:100%;}
+audio{vertical-align:middle;}
 </style>
 </head>
 <body>
@@ -579,11 +633,12 @@ img{max-width:100%;}
 <table>
 <thead>
 <tr>
-<th>触发时间</th>
+<th>触发时间(年‑月‑日 时:分:秒)</th>
 <th>持续秒数</th>
 <th>峰值dB</th>
 <th>磁场</th>
 <th>振动m/s²</th>
+<th>噪声录音</th>
 <th>噪声波形截图</th>
 </tr>
 </thead>
@@ -593,7 +648,6 @@ ${tableRows}
 </table>
 </body>
 </html>`;
-
   var blob=new Blob([htmlOut],{type:"text/html;charset=utf‑8"});
   var a=document.createElement("a");
   a.href=URL.createObjectURL(blob);
@@ -601,7 +655,7 @@ ${tableRows}
   document.body.appendChild(a);
   a.click();
   a.remove();
-  toast("已导出HTML报告，"+logArr.length+"条记录，波形图片嵌入文件");
+  toast("已导出HTML报告，"+logArr.length+"条记录，含波形与噪声录音");
 }
 
 /* ---------- 主循环 ---------- */
@@ -625,23 +679,22 @@ function start(){
     toast("启动失败："+(err&&err.message||"请检查 HTTPS 与权限"));
   });
 }
-function stop(){
+async function stop(){
   running=false;
   $("btnStart").textContent="开始监测";
   $("btnStart").className="btn primary";
   if(audioCtx)audioCtx.suspend();
   // 停止监测，如果还有活跃会话立刻落盘保存
-  closeAndSaveSession();
+  await closeAndSaveSession();
 }
 function liveLoop(){
   if(!running)return;
   liveDb();
-  setTimeout(liveLoop,100);
+  setTimeout(liveLoop,100);// 采集：20 次 / 秒
 }
-
 /* ---------- 事件 ---------- */
-$("btnStart").addEventListener("click",function(){
-  if(running){stop();toast("监测已停止");}else{start();}
+$("btnStart").addEventListener("click",async function(){
+  if(running){await stop();toast("监测已停止");}else{start();}
 });
 $("btnClear").addEventListener("click",function(){
   logArr=[];
@@ -652,9 +705,8 @@ $("btnExport").addEventListener("click",exportHtmlReport);
 $("thr").addEventListener("input",function(){
   thr=parseInt(this.value,10);
   $("thrVal").textContent=thr;
-  $("thrTxt").textContent="(> "+thr+" 约dB)";
+  $("thrTxt").textContent="(> "+thr+" dB)";
 });
-
 /* ---------- 安全上下文状态 ---------- */
 function setSecure(){
   var ok=window.isSecureContext===true;
@@ -667,7 +719,6 @@ function setSecure(){
 }
 setSecure();
 function toast(msg){var t=$("toast");t.textContent=msg;t.className="toast show";clearTimeout(t._h);t._h=setTimeout(function(){t.className="toast";},2600);}
-
 drawArc($("gSound"),0,"#22D3EE");
 drawArc($("gMag"),0,"#A78BFA");
 drawArc($("gVib"),0,"#34D399");
