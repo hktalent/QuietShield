@@ -158,7 +158,7 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
   </section>
   <section class="zone" id="logZone">
     <div class="z-h">
-      <span class="nm">超阈值日志<span id="thrTxt" style="color:var(--amber)">（> 60 约dB）</span></span>
+      <span class="nm">超阈值日志<span id="thrTxt" style="color:var(--amber)">（> 60 dB）</span></span>
       <span class="cnt" id="logCnt">0 条</span>
     </div>
     <div class="set">
@@ -672,7 +672,7 @@ function start(){
     running=true;
     $("btnStart").textContent="监测中 · 停止";
     $("btnStart").className="btn red";
-    $("thrTxt").textContent="(> "+thr+" 约dB)";
+    $("thrTxt").textContent="(> "+thr+" dB)";
     audioCtx&&audioCtx.resume();
     liveLoop();
   }).catch(function(err){
