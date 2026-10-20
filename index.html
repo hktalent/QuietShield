@@ -195,6 +195,41 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
 <script>
 (function(){
 "use strict";
+
+var wakeLockSentinel = null;
+
+// 请求屏幕常亮
+async function acquireWakeLock(){
+  if(!("wakeLock" in navigator)){
+    toast("当前iOS版本不支持网页常亮，请设置系统自动锁定为「永不」");
+    return;
+  }
+  try{
+    wakeLockSentinel = await navigator.wakeLock.request('screen');
+    toast("✅已开启屏幕常亮(PWA模式)");
+    // 页面失去可见性自动释放锁；回来尝试重新获取
+    document.addEventListener('visibilitychange', async ()=>{
+      if(wakeLockSentinel !== null && document.visibilityState === 'visible'){
+        try{
+          wakeLockSentinel = await navigator.wakeLock.request('screen');
+        }catch(e){}
+      }
+    });
+  }catch(err){
+    toast("⚠️无法获取屏幕常亮："+err.message+"，请将网页【添加到主屏幕】打开");
+    wakeLockSentinel=null;
+  }
+}
+
+// 释放屏幕常亮
+async function releaseWakeLock(){
+  if(wakeLockSentinel){
+    try{await wakeLockSentinel.release();}catch(e){}
+    wakeLockSentinel=null;
+    toast("已关闭屏幕常亮");
+  }
+}
+
 var $=function(id){return document.getElementById(id);};
 var S={sound:0,mag:0,vib:0};
 var DB={value:0};
@@ -572,6 +607,7 @@ ${tableRows}
 /* ---------- 主循环 ---------- */
 function start(){
   if(running)return;
+  acquireWakeLock();
   resetOverSession();
   var init=Promise.resolve()
     .then(initAudio).then(initMotion).then(function(){
