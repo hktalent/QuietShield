@@ -454,37 +454,72 @@ async function closeAndSaveSession(){
   }
   resetOverSession();
 }
-var avgZspj = 45;
-// 超标会话处理，每帧执行，使用实时thr
+var avgZspj = 50;
+var bgReadyCnt = 0;       // 基线就绪计数
+const alpha = 0.10;
+const TRIG_OFFSET = 5;   // 触发：背景之上5dB开启会话
+const HOLD_AFTER_FALL = 0.4; // 跌落之后保持0.4秒才关闭
+const MAX_SESSION_SEC = 12;  // 会话最大时长兜底
+var fallTs = null;         // 跌落时间戳
+
 function processOverThreshold(currentDb){
-  // alpha 0~1，越小越跟随新数据；0.08~0.15适合噪声背景
-  const alpha = 0.10;
+  const nowTs = Date.now();
+  // EMA更新基线：只有非噪声会话才更新，统计安静环境
   if(!overSession.active){
-      avgZspj = avgZspj * (1-alpha) + currentDb * alpha;
+    avgZspj = avgZspj * (1-alpha) + currentDb * alpha;
+    bgReadyCnt++;
   }
-  var nowTs=Date.now();
-  var magSnapTxt = magMode==="magnetometer" ? (magTotalUt.toFixed(1)+" µT") : $("compass").textContent;
-  if(currentDb > thr){
-    // 当前分贝大于实时阈值，维持/开启会话
-    if(!overSession.active){
+
+  const magSnapTxt = magMode==="magnetometer" ? (magTotalUt.toFixed(1)+" µT") : $("compass").textContent;
+  const triggerLevel = avgZspj + TRIG_OFFSET;
+
+  // 会话未激活状态
+  if(!overSession.active){
+    fallTs = null;
+    // 基线采样未足够，直接返回，不触发
+    if(bgReadyCnt < 10) return;
+    // ✅开启条件基于动态背景基线，不再用thr
+    if(currentDb > triggerLevel){
       overSession.active = true;
       overSession.startTs = nowTs;
       overSession.peakDb = currentDb;
       overSession.magSnap = magSnapTxt;
       overSession.vibSnap = vibSmooth;
       startRecordAudio();
-    }else{
-      if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
-      overSession.vibSnap = vibSmooth;
-      overSession.magSnap = magSnapTxt;
     }
   }else{
-    // 当前分贝小于实时阈值，关闭会话落盘
-    if(overSession.active && currentDb<=avgZspj){
+    // 【强制超时兜底】防止永久卡死会话
+    const sessionDur = (nowTs - overSession.startTs)/1000;
+    if(sessionDur >= MAX_SESSION_SEC){
       closeAndSaveSession();
+      return;
+    }
+
+    // 更新峰值
+    if(currentDb > overSession.peakDb){
+      overSession.peakDb = currentDb;
+      overSession.magSnap = magSnapTxt;
+      overSession.vibSnap = vibSmooth;
+    }
+
+    // 判断是否回落至基线
+    if(currentDb > avgZspj){
+      fallTs = null; // 还高于基线，清除跌落计时
+    }else{
+      // 已经跌到基线以下，启动hold计时
+      if(fallTs === null){
+        fallTs = nowTs;
+      }else{
+        const holdTime = (nowTs - fallTs)/1000;
+        if(holdTime >= HOLD_AFTER_FALL){
+          // hold时间满足，真正关闭会话
+          closeAndSaveSession();
+        }
+      }
     }
   }
 }
+
 function liveDb(){
   if(!running||!soundLive)return;
   computeDb();
