@@ -19,13 +19,21 @@ async function pushLogToServer(record){
   try{
     const resp = await fetch(LOG_API_URL,{
       method:"POST",
-      headers:{"Content‑Type":"application/json"},
+      headers:{
+        "Content-Type":"application/json"  // ✅普通英文减号
+      },
       body:JSON.stringify(record)
     });
+    if(!resp.ok){
+      // http状态非200抛出异常
+      throw new Error(`HTTP status: ${resp.status}`);
+    }
     const ret = await resp.json();
     console.log("推送日志成功",ret);
   }catch(err){
     console.warn("推送日志失败，不影响本地存储",err);
+    // 可选：toast提示用户
+    // toast("⚠️后台日志推送失败");
   }
 }
 // 请求屏幕常亮
@@ -380,8 +388,18 @@ async function closeAndSaveSession(){
     if(logArr.length>300) logArr.length=300;
     saveLog();
     renderLog();
-    // 主动推送到后台 CSV
-    pushLogToServer(logArr[0]);
+    // 后台异步推送，不阻塞主逻辑
+    pushLogToServer({
+      timeText: fullTimeStr,
+      timeTs: overSession.startTs,
+      durationSec: durSec,
+      peakDb: overSession.peakDb.toFixed(1),
+      mag: overSession.magSnap,
+      vib: overSession.vibSnap.toFixed(2),
+      lat: gpsLat !==null ? gpsLat.toFixed(6) : null,
+      lon: gpsLon !==null ? gpsLon.toFixed(6) : null,
+      audioData:audioB64
+    });
   }
   resetOverSession();
 }
