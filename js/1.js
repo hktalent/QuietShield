@@ -12,6 +12,22 @@ var mediaRecorder = null;
 var recordedChunks = [];
 var micStream = null;
 
+// ===== 后台 CSV 推送 =====
+// 同源部署即可；如跨域可改成 "https://你的服务器:8088/api/log"
+const LOG_API_URL = "/api/log";
+async function pushLogToServer(record){
+  try{
+    const resp = await fetch(LOG_API_URL,{
+      method:"POST",
+      headers:{"Content‑Type":"application/json"},
+      body:JSON.stringify(record)
+    });
+    const ret = await resp.json();
+    console.log("推送日志成功",ret);
+  }catch(err){
+    console.warn("推送日志失败，不影响本地存储",err);
+  }
+}
 // 请求屏幕常亮
 async function acquireWakeLock(){
   if(!("wakeLock" in navigator)){
@@ -364,6 +380,8 @@ async function closeAndSaveSession(){
     if(logArr.length>300) logArr.length=300;
     saveLog();
     renderLog();
+    // 主动推送到后台 CSV
+    pushLogToServer(logArr[0]);
   }
   resetOverSession();
 }

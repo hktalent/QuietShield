@@ -9,6 +9,7 @@ db
 server.crt
 server.key
 MyGp
+logs
 51pwnPlatform
 ScanBuy
 db/
