@@ -1,4 +1,5 @@
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+import traceback
 import ssl
 import json
 import os
@@ -107,7 +108,7 @@ async function playBoostAudio(dataUrl, boostGain=3.0){
 </head>
 <body>
 <h2>噪声监测日志</h2>
-<p>法定《噪声污染防治法》扰民噪声：白天(>=6点 <22点) > 55 dB(A)；夜间 > 45 dB(A); 日志文件创建时间：{boot_time}</p>
+<p>《噪声污染防治法》扰民噪声：白天(>=6点 <22点) > 55 dB(A)；夜间 > 45 dB(A); 日志创建时间：{boot_time}</p>
 <table>
 <thead>
 <tr>
@@ -139,9 +140,11 @@ class MyHandler(SimpleHTTPRequestHandler):
     def _init_daily_html_log(self, log_file_path):
         if not os.path.exists(log_file_path):
             boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = HTML_HEADER.format(boot_time=boot_time)
+            # ✅修复：不用format，只用简单replace，防止JS大括号解析报错
+            header = HTML_HEADER.replace("{boot_time}", boot_time)
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.write(header)
+
 
     def do_POST(self):
         if self.path == "/api/log":
@@ -200,6 +203,8 @@ class MyHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(resp.encode("utf-8"))
 
             except Exception as e:
+                # 打印完整错误堆栈到控制台！非常关键
+                traceback.print_exc()
                 self.send_response(500)
                 self._set_cors()
                 self.send_header("Content-Type", "application/json")
