@@ -3,6 +3,7 @@ import ssl
 import json
 import os
 from datetime import datetime
+import html
 
 ADDR = ('0.0.0.0', 8088)
 LOG_DIR = "logs"
@@ -15,7 +16,16 @@ def get_daily_log_filename():
     return os.path.join(LOG_DIR, f"noise_log_{today}.html")
 
 
-# HTML头部模板，新文件创建时写入
+def extract_mime_from_dataurl(dataurl):
+    """从dataURL字符串提取mime类型"""
+    if not dataurl or not dataurl.startswith("data:"):
+        return None
+    head = dataurl.split(",")[0]
+    mime_part = head.split(":")[1].split(";")[0]
+    return mime_part
+
+
+# HTML头部模板，script放在head内部
 HTML_HEADER = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -28,7 +38,72 @@ table{{border-collapse:collapse;width:100%;font-size:12px;}}
 th{{background:#222;color:#fff;padding:8px;text-align:left;}}
 td{{background:#fff;padding:6px 8px;border-bottom:#ccc 1px solid;}}
 audio{{vertical-align:middle;height:28px;max-width:240px;}}
+button{{padding:3px 6px;font-size:11px;cursor:pointer;}}
 </style>
+<script>
+let playBoostAudioCtx = null;
+async function playBoostAudio(dataUrl, boostGain=3.0){
+    // 关闭上一个实例
+    if(playBoostAudioCtx){
+        try{ playBoostAudioCtx.close(); }catch(e){}
+        playBoostAudioCtx = null;
+    }
+    playBoostAudioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    if(playBoostAudioCtx.state === 'suspended'){
+        await playBoostAudioCtx.resume();
+    }
+
+    try{
+        // dataURL 转 ArrayBuffer
+        const base64Str = dataUrl.split(",")[1];
+        const binaryStr = atob(base64Str);
+        const len = binaryStr.length;
+        const buf = new Uint8Array(len);
+        for(let i=0;i<len;i++){
+            buf[i] = binaryStr.charCodeAt(i);
+        }
+
+        // 解码音频二进制
+        const audioBuf = await playBoostAudioCtx.decodeAudioData(buf.buffer);
+
+        // 创建播放源
+        const srcNode = playBoostAudioCtx.createBufferSource();
+        srcNode.buffer = audioBuf;
+
+        const gainNode = playBoostAudioCtx.createGain();
+        gainNode.gain.value = boostGain;
+
+        // 压缩器防爆音削波
+        const compressor = playBoostAudioCtx.createDynamicsCompressor();
+        compressor.threshold.value = -18;
+        compressor.knee.value = 10;
+        compressor.ratio.value = 4;
+        compressor.attack.value = 0.003;
+        compressor.release.value = 0.25;
+
+        // 链路：bufferSource → gain → compressor → 扬声器
+        srcNode.connect(gainNode);
+        gainNode.connect(compressor);
+        compressor.connect(playBoostAudioCtx.destination);
+
+        // 播放结束自动关闭上下文
+        srcNode.onended = ()=>{
+            if(playBoostAudioCtx){
+                playBoostAudioCtx.close();
+                playBoostAudioCtx = null;
+            }
+        };
+        srcNode.start(0);
+
+    }catch(err){
+        alert("音频播放失败："+err.message);
+        if(playBoostAudioCtx){
+            playBoostAudioCtx.close();
+            playBoostAudioCtx=null;
+        }
+    }
+}
+</script>
 </head>
 <body>
 <h2>噪声监测日志</h2>
@@ -52,7 +127,6 @@ audio{{vertical-align:middle;height:28px;max-width:240px;}}
 
 class MyHandler(SimpleHTTPRequestHandler):
     def _set_cors(self):
-        # ✅全部使用ASCII普通减号 `-`，杜绝U+2011长破折号
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST,GET,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -63,7 +137,6 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def _init_daily_html_log(self, log_file_path):
-        """当日日志文件不存在，写入头部，不写入闭合标签"""
         if not os.path.exists(log_file_path):
             boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             header = HTML_HEADER.format(boot_time=boot_time)
@@ -79,20 +152,29 @@ class MyHandler(SimpleHTTPRequestHandler):
                 length = int(self.headers["Content-Length"])
                 body = self.rfile.read(length)
                 payload = json.loads(body.decode("utf-8"))
-                remote_ip = self.client_address[0]
-                ua = self.headers.get("User-Agent", "")
-                
-                audio_b64 = payload.get("audioData")
-                if audio_b64:
-                    audio_html = f'<audio controls preload="none"><source src="{audio_b64}" type="audio/webm">不支持播放'
-                else:
-                    audio_html = '<span style="color:#888">无录音</span>'
 
-                timeText = payload.get("timeText", "")
-                durSec = payload.get("durationSec", "")
-                peakDb = payload.get("peakDb", "")
-                lat = payload.get("lat", "--")
-                lon = payload.get("lon", "--")
+                remote_ip = html.escape(self.client_address[0])
+                ua = html.escape(self.headers.get("User-Agent", ""))
+
+                audio_b64 = payload.get("audioData")
+                audio_html = '<span style="color:#888">无录音</span>'
+                if audio_b64:
+                    mime = extract_mime_from_dataurl(audio_b64)
+                    if not mime:
+                        mime = "audio/webm"
+                    b64_escaped_html = audio_b64.replace("'", "&#39;")
+                    # ✅修复onclick属性完整引号包裹，使用&#39;传参
+                    audio_html = (
+                        f'<audio controls preload="none"><source src="{html.escape(audio_b64)}" type="{html.escape(mime)}">不支持播放'
+                        f'</audio><br><button onclick="const s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,3.0);">🔊×3放大播放</button>'
+                    )
+
+                # 全部外部字段做HTML转义！防止UA/特殊字符破坏表格
+                timeText = html.escape(payload.get("timeText", ""))
+                durSec = html.escape(payload.get("durationSec", ""))
+                peakDb = html.escape(payload.get("peakDb", ""))
+                lat = html.escape(str(payload.get("lat", "--")))
+                lon = html.escape(str(payload.get("lon", "--")))
 
                 tr_html = (
                     f"<tr>"
