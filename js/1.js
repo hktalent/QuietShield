@@ -85,6 +85,11 @@ var gpsLon = null;
 var gpsWatchId = null;
 const GPS_REFRESH_INTERVAL = 30000; // 30秒刷新一次位置
 
+
+setInterval(function(){
+  $("sssb").innerHTML= "实时声波 - " + formatFullTime(new Date());
+},1000)
+
 // 启动持续定位监听
 function startGps(){
   if(!navigator.geolocation){
