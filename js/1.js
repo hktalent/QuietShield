@@ -185,7 +185,8 @@ function startRecordAudio(){
     mediaRecorder.ondataavailable = function(e){
       if(e.data.size>0) recordedChunks.push(e.data);
     };
-    mediaRecorder.start();
+    // 关键：每100ms输出音频分片，防止短噪声丢失音频数据
+    mediaRecorder.start(100);
   }catch(err){
     console.warn("录音启动失败",err);
     mediaRecorder = null;
@@ -198,8 +199,18 @@ async function stopRecordAudio(){
       resolve(null);
       return;
     }
+    function cleanup(){
+      mediaRecorder.onstop = null;
+      mediaRecorder.onerror = null;
+    }
+    mediaRecorder.onerror = function(err){
+      console.warn("MediaRecorder 录音发生错误", err);
+      cleanup();
+      resolve(null);
+    };
     mediaRecorder.onstop = async ()=>{
-      const blob = new Blob(recordedChunks, {type:"audio/webm"});
+      const blob = new Blob(recordedChunks, {type:mediaRecorder.mimeType});
+      cleanup();
       const reader = new FileReader();
       reader.onloadend = ()=>{
         resolve(reader.result);
@@ -591,7 +602,8 @@ function exportHtmlReport(){
     var rec=logArr[i];
     let audioHtml = "";
     if(rec.audioData){
-      audioHtml = `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${rec.audioData}" type="audio/webm">你的浏览器不支持播放该音频`;
+      const mime = rec.audioMime || "audio/webm";
+      audioHtml = `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${rec.audioData}" type="${mime}">你的浏览器不支持播放该音频`;
     }else{
       audioHtml = `<span style="color:#888">无录音片段</span>`;
     }
