@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>录像回看 · QuietShield</title>
+<style>
+:root{--bg:#0B1015;--panel:#111A22;--line:#1E2A35;--text:#E6EDF3;--muted:#7B8A99;--cyan:#22D3EE;--amber:#F5A623;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,"PingFang SC",sans-serif;padding:18px}
+#wrap{max-width:960px;margin:0 auto}
+h1{font-size:17px;margin-bottom:4px}
+.sub{font-size:11px;color:var(--muted);font-family:monospace}
+.refresh{margin:10px 0 16px;padding:8px 16px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);cursor:pointer;font-size:13px}
+.refresh:active{transform:translateY(1px)}
+.session{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:14px}
+.session .head{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-bottom:8px;align-items:baseline}
+.session .dev{font-size:12px;color:var(--cyan);font-family:monospace;word-break:break-all}
+.session .meta{font-size:11px;color:var(--muted);font-family:monospace}
+.segs{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.seg video{width:100%;background:#000;border-radius:6px;border:1px solid var(--line)}
+.seg .cap{font-size:10px;color:var(--muted);font-family:monospace;margin-top:3px}
+.empty{color:var(--muted);text-align:center;padding:30px;font-size:13px}
+.badge{font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid var(--amber);color:var(--amber)}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>录像回看 · 后台存储</h1>
+  <div class="sub" id="status">加载中…</div>
+  <button class="refresh" id="btnRefresh">↻ 刷新列表</button>
+  <div id="list"></div>
+</div>
+<script>
+async function load(){
+  var st=$("status"), list=$("list");
+  st.textContent="加载中…";
+  try{
+    var r=await fetch("/api/videos");
+    var data=await r.json();
+    if(!data.ok) throw new Error(data.err||"加载失败");
+    var sessions=data.sessions||[];
+    st.textContent="共 "+sessions.length+" 个会话（设备指纹为目录名，天然隔离多设备，互不冲突）";
+    if(!sessions.length){ list.innerHTML='<div class="empty">暂无录像。在监测台点「开始录像」，每 5 秒分片实时上传到这里。</div>'; return; }
+    list.innerHTML="";
+    sessions.forEach(function(s){
+      var m=s.meta||{};
+      var segHtml;
+      if(s.mp4s && s.mp4s.length){
+        // 合并后的 10 分钟 MP4 为主
+        segHtml = s.mp4s.map(function(mp){
+          return '<div class="seg"><video controls preload="metadata" src="'+mp.url+'"></video>'+
+                 '<div class="cap">MP4 · 第'+mp.part+'段</div></div>';
+        }).join("");
+      } else {
+        segHtml = (s.segments||[]).map(function(seg){
+          return '<div class="seg"><video controls preload="metadata" src="'+seg.url+'"></video>'+
+                 '<div class="cap">seg#'+seg.index+' · '+seg.segStart+' → '+seg.segEnd+'</div></div>';
+        }).join("");
+      }
+      var metaTxt="时长 "+((m.durationSec||"--")+"s")+" · 峰值 "+(m.peakDb||"--")+" dB"+
+                  ((s.mp4s&&s.mp4s.length)?(" · MP4 "+s.mp4s.length+" 段"):(" · 分片 "+((s.segments||[]).length)+" 段"));
+      var endTxt = m.end ? "结束 "+m.end : "";
+      var d=document.createElement("div");
+      d.className="session";
+      d.innerHTML='<div class="head"><span class="dev">📱 设备 '+s.deviceId+'</span>'+
+        '<span class="badge">🏷 '+s.tag+'</span></div>'+
+        '<div class="meta">开始 '+s.sessionStart+' · '+endTxt+' · '+metaTxt+'</div>'+
+        '<div class="segs">'+segHtml+'</div>';
+      list.appendChild(d);
+    });
+  }catch(e){
+    st.textContent="加载失败："+e.message;
+  }
+}
+function $(id){return document.getElementById(id);}
+$("btnRefresh").addEventListener("click", load);
+load();
+</script>
+</body>
+</html>
