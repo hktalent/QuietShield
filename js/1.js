@@ -170,8 +170,75 @@ function getTag(){
 }
 
 /* ---------- 存储 ---------- */
+// 波形图/音频等大体积媒体存 IndexedDB，localStorage 只存文字字段（避免 5MB 上限）
+var idb=null;
+function openDB(){
+  return new Promise(function(resolve,reject){
+    if(idb){ resolve(idb); return; }
+    var req=indexedDB.open("qs_media_db",1);
+    req.onupgradeneeded=function(e){
+      var db=e.target.result;
+      if(!db.objectStoreNames.contains("media"))
+        db.createObjectStore("media",{keyPath:"timeTs"});
+    };
+    req.onsuccess=function(){ idb=req.result; resolve(idb); };
+    req.onerror=function(){ reject(req.error); };
+  });
+}
+function putMedia(timeTs, waveImg, audioData){
+  if(timeTs==null) return Promise.resolve();
+  return openDB().then(function(db){
+    return new Promise(function(res,rej){
+      var tx=db.transaction("media","readwrite");
+      tx.objectStore("media").put({timeTs:timeTs, waveImg:waveImg||null, audioData:audioData||null});
+      tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
+    });
+  }).catch(function(e){ console.warn("媒体写入失败",e); });
+}
+function getMedia(timeTs){
+  return openDB().then(function(db){
+    return new Promise(function(res,rej){
+      var tx=db.transaction("media","readonly");
+      var rq=tx.objectStore("media").get(timeTs);
+      rq.onsuccess=function(){ res(rq.result||null); };
+      rq.onerror=function(){ rej(rq.error); };
+    });
+  }).catch(function(){ return null; });
+}
+function getAllMedia(){
+  return openDB().then(function(db){
+    return new Promise(function(res,rej){
+      var tx=db.transaction("media","readonly");
+      var rq=tx.objectStore("media").getAll();
+      rq.onsuccess=function(){ res(rq.result||[]); };
+      rq.onerror=function(){ rej(rq.error); };
+    });
+  }).catch(function(){ return []; });
+}
+function clearMedia(){
+  return openDB().then(function(db){
+    return new Promise(function(res,rej){
+      var tx=db.transaction("media","readwrite");
+      tx.objectStore("media").clear();
+      tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
+    });
+  }).catch(function(){});
+}
+
 function loadLog(){
   try{ var r=JSON.parse(localStorage.getItem("sm_log")||"[]"); if(Array.isArray(r)) logArr=r; }catch(e){ logArr=[]; }
+  // 迁移旧数据：若旧日志仍含媒体字段，写入 IndexedDB 并从数组剥离，只留文字
+  var dirty=false;
+  for(var i=0;i<logArr.length;i++){
+    var rec=logArr[i];
+    if(rec && (rec.audioData!==undefined || rec.waveImg!==undefined)){
+      putMedia(rec.timeTs, rec.waveImg, rec.audioData);
+      if("waveImg" in rec) delete rec.waveImg;
+      if("audioData" in rec) delete rec.audioData;
+      dirty=true;
+    }
+  }
+  if(dirty) saveLog();
   renderLog();
 }
 function saveLog(){
@@ -226,10 +293,10 @@ async function closeAndSaveSession(){
   if(parseFloat(durSec) >= MIN_RECORD_SEC){
     var waveImgB64 = $("scope").toDataURL("image/png");
     var fullTimeStr = formatFullTime(overSession.startTs);
+    putMedia(overSession.startTs, waveImgB64, audioB64); // 波形图+音频 → IndexedDB
     logArr.unshift({
       timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
-      peakDb: overSession.peakDb.toFixed(1), waveImg: waveImgB64, tag: getTag(),
-      audioData: audioB64,
+      peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
       lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
     });
     if(logArr.length>300) logArr.length=300;
@@ -536,30 +603,41 @@ function renderLog(){
   for(var i=0;i<logArr.length;i++){
     var r=logArr[i];
     var tr=document.createElement("tr"); tr.className="alarm";
-    var au = r.audioData
-      ? '<audio controls preload="none"><source src="'+r.audioData+'" type="audio/webm">不支持</audio>'+
-        '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,5.0);">🔊×5</button>'
-      : '<span class="muted">—</span>';
     tr.innerHTML=
       '<td>'+(r.timeText||"--")+'</td>'+
       '<td>'+(r.tag||"--")+'</td>'+
       '<td>'+(r.durationSec||"N/A")+'s</td>'+
       '<td>'+r.peakDb+'</td>'+
-      '<td class="au">'+au+'</td>'+
+      '<td class="au"><span class="muted">—</span></td>'+
       '<td>'+(r.lat??"--")+'</td>'+
       '<td>'+(r.lon??"--")+'</td>';
     b.appendChild(tr);
+    // 音频从 IndexedDB 异步取回，取到后填充播放控件
+    (function(ts, cell){
+      if(ts==null) return;
+      getMedia(ts).then(function(m){
+        if(!cell || !m || !m.audioData) return;
+        cell.innerHTML='<audio controls preload="none"><source src="'+m.audioData+'" type="audio/webm">不支持</audio>'+
+          '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,5.0);">🔊×5</button>';
+      }).catch(function(){});
+    })(r.timeTs, tr.querySelector(".au"));
   }
 }
 
-function exportHtmlReport(){
+async function exportHtmlReport(){
   if(!logArr.length){ toast("暂无日志可导出"); return; }
+  // 从 IndexedDB 取回全部媒体（波形图+音频）
+  var mediaMap={};
+  try{ (await getAllMedia()).forEach(function(m){ mediaMap[m.timeTs]=m; }); }catch(e){}
   var reportTitle="传感器噪声监测报告 "+new Date().toLocaleString();
   var rows="";
   for(var i=0;i<logArr.length;i++){
     var rec=logArr[i];
-    var audioHtml = rec.audioData
-      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${rec.audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,5.0);">🔊×5放大播放</button>`
+    var media=mediaMap[rec.timeTs]||{};
+    var audioData=media.audioData||null;
+    var waveImg=media.waveImg||null;
+    var audioHtml = audioData
+      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,5.0);">🔊×5放大播放</button>`
       : '<span style="color:#888">无录音片段</span>';
     rows += `<tr style="border-bottom:#ccc 1px solid;">
   <td style="padding:6px 8px">${rec.timeText}</td>
@@ -567,7 +645,7 @@ function exportHtmlReport(){
   <td style="padding:6px 8px">${rec.durationSec||"N/A"} s</td>
   <td style="padding:6px 8px">${rec.peakDb} dB</td>
   <td style="padding:6px 8px">${audioHtml}</td>
-  <td style="padding:6px 8px"><img src="${rec.waveImg}" style="width:280px;border:1px solid #666;"></td>
+  <td style="padding:6px 8px">${waveImg?`<img src="${waveImg}" style="width:280px;border:1px solid #666;">`:'<span style="color:#888">无波形</span>'}</td>
   <td style="padding:6px 8px">${rec.lat??"--"}</td>
   <td style="padding:6px 8px">${rec.lon??"--"}</td>
 </tr>
@@ -617,7 +695,7 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
 $("btnStart").addEventListener("click", async function(){
   if(running){ await stopMonitor(); toast("监测与录像已停止"); } else startMonitor();
 });
-$("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(); saveLog(); renderLog(); toast("日志已清空"); });
+$("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(); clearMedia(); saveLog(); renderLog(); toast("日志已清空"); });
 $("btnExport").addEventListener("click", exportHtmlReport);
 
 setInterval(function(){ $("sssb").innerHTML="实时声波 - "+formatFullTime(new Date()); },1000);
