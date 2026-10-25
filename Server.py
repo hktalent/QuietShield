@@ -22,6 +22,8 @@ _io_lock = threading.Lock()
 
 # ffmpeg 绝对路径（合并 MP4 用）；不存在时回退到 PATH 中的 ffmpeg
 FFMPEG = "/Users/51pwn/anaconda3/bin/ffmpeg" if os.path.exists("/Users/51pwn/anaconda3/bin/ffmpeg") else "ffmpeg"
+# 水印字体（支持中文）；macOS 系统字体路径
+DRAWTEXT_FONT = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf" if os.path.exists("/System/Library/Fonts/Supplemental/Arial Unicode.ttf") else "/System/Library/Fonts/Helvetica.ttc"
 
 # 只允许安全字符，防路径穿越与文件名注入（\w 含中文与数字，故标签如"客厅"可保留）
 _SAFE_RE = re.compile(r"[^\w\-]")
@@ -232,11 +234,28 @@ class MyHandler(SimpleHTTPRequestHandler):
             inputs = []
             for _, p in segs:
                 inputs += ["-i", p]
-            flt = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + \
-                  f"concat=n={n}:v=1:a=1[v][a]"
+            concat = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + \
+                     f"concat=n={n}:v=1:a=1[v][a]"
+            # 水印：标签 + 年月日 时分秒（动态时间戳，随播放从会话开始连续推进）
+            map_v = "[v]"
+            try:
+                mts = re.search(r"_(\d{8})_(\d{6})$", session_key)
+                start_epoch = int(datetime.strptime(
+                    f"{mts.group(1)}_{mts.group(2)}", "%Y%m%d_%H%M%S").timestamp())
+                tag_safe = re.sub(r"[\\:'\";,\[\]%{}\x00-\x1f]", "",
+                                  re.sub(r"_\d{8}_\d{6}$", "", session_key))
+                wtext = f"{tag_safe} %{{pts\\:localtime\\:{start_epoch}}}"
+                wm = (f"[v]drawtext=fontfile='{DRAWTEXT_FONT}':"
+                      f"text='{wtext}':x=20:y=20:"
+                      f"fontsize='max(20, w*0.04)':fontcolor=white:"
+                      f"box=1:boxcolor=black@0.4:boxborderw=10[vW]")
+                flt = concat + ";" + wm
+                map_v = "[vW]"
+            except Exception:
+                flt = concat
             out_pat = os.path.join(dev_dir, session_key + "_tmp_%03d.mp4")
             cmd = ([FFMPEG, "-y", "-loglevel", "error"] + inputs +
-                   ["-filter_complex", flt, "-map", "[v]", "-map", "[a]",
+                   ["-filter_complex", flt, "-map", map_v, "-map", "[a]",
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
                     "-c:a", "aac", "-g", "150",
                     "-force_key_frames", "expr:gte(t,n_forced*600)",
