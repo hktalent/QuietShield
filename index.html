@@ -8,7 +8,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
-<title>传感器监测台 · 声·磁·振</title>
+<title>传感器监测台 · 声·录像</title>
 <link href=css/1.css rel=stylesheet>
 </head>
 <body>
@@ -16,64 +16,65 @@
   <header>
     <div class="brand">
       <div>
-        <h1>传感器监测台（权威矫正）</h1>
+        <h1>传感器监测台（噪声·前置录像）</h1>
+        <div class="sub" id="devFp">设备指纹：计算中…</div>
       </div>
     </div>
   </header>
-  <section class="grid">
+  <section class="dashboard">
     <div class="card">
       <div class="h"><span class="nm">声压级</span><span class="dot" id="dSound"></span></div>
       <div class="gauge"><canvas id="gSound"></canvas></div>
-      <div class="gvalue"><span class="v" id="vSound">--</span><span class="u">dB</span></div>
       <div class="gstate" id="sSound">等待麦克风</div>
     </div>
-    <div class="card">
-      <div class="h"><span class="nm">磁场</span><span class="dot" id="dMag"></span></div>
-      <div class="gauge"><canvas id="gMag"></canvas></div>
-      <div class="gvalue"><span class="v" id="vMag">--</span><span class="u" id="uMag">方向</span></div>
-      <div class="compass-read"><span class="hd">罗盘</span><span id="compass" class="v">--°</span></div>
-    </div>
-    <div class="card">
-      <div class="h"><span class="nm">振动</span><span class="dot" id="dVib"></span></div>
-      <div class="gauge"><canvas id="gVib"></canvas></div>
-      <div class="gvalue"><span class="v" id="vVib">--.--</span><span class="u">m/s²</span></div>
-      <div class="gstate" id="sVib">等待授权</div>
-      <div class="vibval">
-        <div class="col"><div class="n" id="vibX">--</div><div class="l">X</div></div>
-        <div class="col"><div class="n" id="vibY">--</div><div class="l">Y</div></div>
-        <div class="col"><div class="n" id="vibZ">--</div><div class="l">Z</div></div>
+    <section class="zone video">
+      <div class="z-h">
+        <span class="nm">前置摄像头录像</span>
+        <span class="cnt" id="videoStat">未录制 · 0 段</span>
       </div>
-    </div>
+      <video id="preview" autoplay muted playsinline></video>
+      <div class="set">
+        <label for="tagInput">录像标签</label>
+        <input type="text" id="tagInput" placeholder="如：客厅、卧室" maxlength="24" autocomplete="off">
+      </div>
+      <div class="meta">
+        <span id="sessionId" class="sub">会话：--</span>
+      </div>
+    </section>
   </section>
+
   <section class="wave">
     <div class="w-h"><span class="nm" id=sssb>实时声波</span><span class="live-db" id="liveDb">-- dB</span></div>
     <canvas id="scope"></canvas>
   </section>
+
   <section class="zone" id="logZone">
-    <div class="z-h"><span class="cnt">《噪声污染防治法》扰民噪声：白天(>=6点 <22点) > 55 dB(A)；夜间 > 45 dB(A);日志：<span>
+    <div class="z-h">
+      <span class="nm">噪声事件日志</span>
       <span class="cnt" id="logCnt">0 条</span>
     </div>
-    
     <div class="btns">
       <button class="btn primary" id="btnStart">开始监测</button>
       <button class="btn red" id="btnClear">清空日志</button>
-      <button class="btn green" id="btnExport">导出 HTML报告</button>
+      <button class="btn green" id="btnExport">导出 HTML 报告</button>
     </div>
     <div class="log"><table>
       <colgroup>
-        <col class="t"><col class="dur"><col class="d"><col class="m"><col class="v">
+        <col class="t"><col class="tag"><col class="dur"><col class="d"><col class="au"><col class="m"><col class="v">
       </colgroup>
       <thead>
         <tr>
           <th>触发时间</th>
+          <th>标签</th>
           <th>持续秒</th>
           <th>峰值dB</th>
+          <th>噪声录音</th>
           <th>纬度</th>
           <th>经度</th>
         </tr>
       </thead>
       <tbody id="logBody">
-        <tr><td colspan="5" class="empty">尚无记录。开始监测后，声压超过阈值持续一段时间会记入日志。</td></tr>
+        <tr><td colspan="7" class="empty">尚无记录。开始监测后，声压超过阈值持续一段时间会记入日志。</td></tr>
       </tbody>
     </table></div>
   </section>

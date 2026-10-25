@@ -35,18 +35,22 @@ header{padding:14px 0 10px;display:flex;align-items:center;justify-content:space
 .ctx .tag.ask{color:var(--amber);border-color:rgba(245,166,35,.4)}
 /* ===== 仪表卡 ===== */
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 10px 10px;min-width:0}
+.grid.one{grid-template-columns:1fr;max-width:420px;margin-left:auto;margin-right:auto}
+/* ===== 仪表+录像 自适应行：当前2列各50%，将来可加 .cols-3 变3列 ===== */
+.dashboard{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:12px;align-items:stretch}
+.dashboard.cols-3{grid-template-columns:repeat(3,1fr)}
+.dashboard .card, .dashboard .zone{min-width:0;margin-top:0}
+/* 声压卡作为尺寸容器，dB 数字用容器查询单位自适应（不写死，随列宽缩放） */
+.card{container-type:inline-size}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 8px 6px;min-width:0}
 .card .h{display:flex;justify-content:space-between;align-items:center;gap:6px}
-.card .h .nm{font-size:11px;color:var(--muted);font-weight:600}
+.card .h .nm{font-size:12px;color:var(--muted);font-weight:600}
 .card .h .dot{width:8px;height:8px;border-radius:50%;background:var(--line)}
 .card .h .dot.live{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,.7);animation:pulse 1.6s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.gauge{position:relative;display:block;margin:2px auto 0;width:100%;max-width:210px}
-.gauge canvas{display:block;width:100%;height:auto}
-.gvalue{text-align:center;margin-top:-2px}
-.gvalue .v{font-family:var(--mono);font-weight:700;font-size:30px;line-height:1;color:var(--text);font-variant-numeric:tabular-nums}
-.gvalue .u{font-size:11px;color:var(--muted);margin-left:2px}
-.gstate{text-align:center;font-size:10px;color:var(--muted);margin-top:3px;min-height:14px}
+.gauge{position:relative;display:block;margin:6px 0 0;width:100%}
+.gauge canvas{display:block;width:100%;aspect-ratio:1.6/1;height:auto}
+.gstate{text-align:center;font-size:11px;color:var(--muted);margin-top:4px;min-height:15px}
 .gstate.warn{color:var(--amber)}
 .gstate.alarm{color:var(--red);font-weight:600}
 .compass-read{text-align:center;font-family:var(--mono);font-size:13px;margin-top:6px;color:var(--text)}
@@ -70,6 +74,8 @@ canvas#scope{display:block;width:100%;height:80px;background:#080C10;border-radi
 .set{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 0;border-top:1px dashed var(--line);border-bottom:1px dashed var(--line)}
 .set label{font-size:11px;color:var(--muted)}
 .set input[type=range]{flex:1;min-width:120px;accent-color:var(--cyan);height:26px}
+.set input[type=text]{flex:1;min-width:120px;background:#0E161D;border:1px solid var(--line);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px}
+.set input[type=text]:focus{outline:2px solid var(--cyan);outline-offset:1px}
 .set .thv{font-family:var(--mono);font-weight:700;color:var(--amber);font-size:14px}
 .btns{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .btn{flex:1;min-height:44px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--panel2);color:var(--text);display:inline-flex;align-items:center;justify-content:center;gap:6px}
@@ -81,18 +87,28 @@ canvas#scope{display:block;width:100%;height:80px;background:#080C10;border-radi
 .btn[disabled]{opacity:.4;pointer-events:none}
 .log{max-height:260px;overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:8px}
 table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;table-layout:fixed}
-colgroup col.t{width:26%}
-colgroup col.dur{width:12%}
-colgroup col.d{width:14%}
-colgroup col.m{width:22%}
-colgroup col.v{width:26%}
+colgroup col.t{width:22%}
+colgroup col.tag{width:10%}
+colgroup col.dur{width:10%}
+colgroup col.d{width:12%}
+colgroup col.au{width:16%}
+colgroup col.m{width:15%}
+colgroup col.v{width:15%}
 th,td{padding:6px 8px;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+td.au audio{height:24px;max-width:150px;vertical-align:middle}
+td.au .au-btn{margin-top:3px;padding:2px 6px;font-size:10px;border:1px solid var(--line);background:var(--panel2);color:var(--cyan);border-radius:5px;cursor:pointer}
+.muted{color:var(--muted)}
 thead th{position:sticky;top:0;background:#0E161D;color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);font-size:10px}
 tbody tr{border-bottom:1px solid #17222B}
 tbody tr:last-child{border-bottom:none}
 tbody tr.alarm td:first-child{color:var(--red);font-weight:700}
 tbody tr.alarm{background:rgba(239,68,68,.05)}
 .empty{color:var(--muted);text-align:center;padding:22px 10px;font-size:12px}
+/* ===== 录像区 ===== */
+.zone.video .z-h .nm{font-size:13px;font-weight:700}
+video#preview{display:block;width:100%;max-height:360px;background:#000;border-radius:8px;border:1px solid var(--line);margin-top:8px;object-fit:cover}
+.zone.video .meta{margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.zone.video .meta .sub{display:block;word-break:break-all}
 /* ===== 说明 ===== */
 .note{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
 .note h3{font-size:13px;margin-bottom:8px}
@@ -106,5 +122,4 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
   body{padding:0 0 60px}
   #wrap{max-width:760px;padding:0 20px}
   .grid{grid-template-columns:repeat(3,1fr);gap:14px}
-  .gvalue .v{font-size:34px}
 }

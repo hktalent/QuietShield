@@ -10,6 +10,7 @@ server.crt
 server.key
 MyGp
 logs
+videos
 51pwnPlatform
 ScanBuy
 db/
