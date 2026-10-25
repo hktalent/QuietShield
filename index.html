@@ -50,15 +50,10 @@
     <canvas id="scope"></canvas>
   </section>
   <section class="zone" id="logZone">
-    <div class="z-h">
-      <span class="nm">超阈值日志<span id="thrTxt" style="color:var(--amber)">（> 70 dB）</span></span>
+    <div class="z-h"><span class="cnt">法定《噪声污染防治法》扰民噪声：白天(>=6点 <22点) > 55 dB(A)；夜间 > 45 dB(A);日志：<span>
       <span class="cnt" id="logCnt">0 条</span>
     </div>
-    <div class="set">
-      <label for="thr">报警阈值</label>
-      <input type="range" id="thr" min="30" max="100" step="1" value="70">
-      <span class="thv" id="thrVal">70</span>
-    </div>
+    
     <div class="btns">
       <button class="btn primary" id="btnStart">开始监测</button>
       <button class="btn red" id="btnClear">清空日志</button>
@@ -73,8 +68,8 @@
           <th>触发时间</th>
           <th>持续秒</th>
           <th>峰值dB</th>
-          <th>磁场</th>
-          <th>振动m/s²</th>
+          <th>纬度</th>
+          <th>经度</th>
         </tr>
       </thead>
       <tbody id="logBody">
