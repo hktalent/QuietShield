@@ -232,6 +232,7 @@ async function closeAndSaveSession(){
       audioData: audioB64,
       lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
     });
+    if(logArr.length>300) logArr.length=300;
     saveLog(); renderLog();
     pushLogToServer({
       timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
