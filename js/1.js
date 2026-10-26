@@ -333,23 +333,23 @@ async function closeAndSaveSession(){
   var nowTs = Date.now();
   var durSec = ((nowTs - overSession.startTs)/1000).toFixed(1);
   var audioB64 = await stopRecordAudio();
-  if(parseFloat(durSec) >= MIN_RECORD_SEC){
-    var fullTimeStr = formatFullTime(overSession.startTs);
-    putMedia(overSession.startTs, audioB64); // 音频 → IndexedDB
-    logArr.unshift({
-      timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
-      peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
-      lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
-    });
-    if(logArr.length>300) logArr.length=300;
-    saveLog(); renderLog();
-    pushLogToServer({
-      timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
-      peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
-      audioData: validAudio(audioB64) ? audioB64 : null,
-      lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
-    });
-  }
+  // 噪声样本无效/为空，或持续时长过短 → 不记录这条日志
+  if(!validAudio(audioB64) || parseFloat(durSec) < MIN_RECORD_SEC){ resetOverSession(); return; }
+  var fullTimeStr = formatFullTime(overSession.startTs);
+  putMedia(overSession.startTs, audioB64); // 音频 → IndexedDB
+  logArr.unshift({
+    timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
+    peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
+    lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
+  });
+  if(logArr.length>300) logArr.length=300;
+  saveLog(); renderLog();
+  pushLogToServer({
+    timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
+    peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
+    audioData: audioB64,
+    lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
+  });
   resetOverSession();
 }
 
