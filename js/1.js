@@ -90,6 +90,9 @@ function ensureStream(){
 // ================= 声压 / 噪声检测 =================
 var audioCtx=null, analyser=null, micData=null;
 var scopeBuf=[];
+var ltFz = 5 * 600; // N分钟
+var scopeEnv=[];   // 5分钟 dB 包络（每100ms一点），横轴呈现近5分钟突发噪声
+var hoverX=-1;     // 波形图悬停 x（CSS像素），-1 表示未悬停
 var soundLive=false;
 var S={sound:0};
 var DB={value:0};
@@ -134,6 +137,10 @@ function computeDb(){
   for(var k=0;k<micData.length;k+=step) scopeBuf.push(micData[k]-dc);
   if(scopeBuf.length>400) scopeBuf = scopeBuf.slice(-400);
 
+  // 5分钟 dB 包络：记录当前时间戳与 dB，供波形图呈现近 5 分钟的突发噪声与悬停取值
+  scopeEnv.push({t: Date.now(), db: DB.value});
+  if(scopeEnv.length > ltFz) scopeEnv.splice(0, scopeEnv.length-ltFz);
+
   if(!overSession.active){
     if(noiseFloorSamples < NOISE_FLOOR_CAL_SEC*10){
       noiseFloorSum += db; noiseFloorSamples++;
@@ -170,7 +177,7 @@ function getTag(){
 }
 
 /* ---------- 存储 ---------- */
-// 波形图/音频等大体积媒体存 IndexedDB，localStorage 只存文字字段（避免 5MB 上限）
+// 音频等大体积媒体存 IndexedDB，localStorage 只存文字字段（避免 5MB 上限）
 var idb=null;
 function openDB(){
   return new Promise(function(resolve,reject){
@@ -185,12 +192,12 @@ function openDB(){
     req.onerror=function(){ reject(req.error); };
   });
 }
-function putMedia(timeTs, waveImg, audioData){
+function putMedia(timeTs, audioData){
   if(timeTs==null) return Promise.resolve();
   return openDB().then(function(db){
     return new Promise(function(res,rej){
       var tx=db.transaction("media","readwrite");
-      tx.objectStore("media").put({timeTs:timeTs, waveImg:waveImg||null, audioData:audioData||null});
+      tx.objectStore("media").put({timeTs:timeTs, audioData:audioData||null});
       tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
     });
   }).catch(function(e){ console.warn("媒体写入失败",e); });
@@ -225,6 +232,10 @@ function clearMedia(){
   }).catch(function(){});
 }
 
+function validAudio(a){
+  return typeof a === "string" && a.length > 400 && a.indexOf("base64,") > 0;
+}
+
 function loadLog(){
   try{ var r=JSON.parse(localStorage.getItem("sm_log")||"[]"); if(Array.isArray(r)) logArr=r; }catch(e){ logArr=[]; }
   // 迁移旧数据：若旧日志仍含媒体字段，写入 IndexedDB 并从数组剥离，只留文字
@@ -232,7 +243,7 @@ function loadLog(){
   for(var i=0;i<logArr.length;i++){
     var rec=logArr[i];
     if(rec && (rec.audioData!==undefined || rec.waveImg!==undefined)){
-      putMedia(rec.timeTs, rec.waveImg, rec.audioData);
+      putMedia(rec.timeTs, rec.audioData);
       if("waveImg" in rec) delete rec.waveImg;
       if("audioData" in rec) delete rec.audioData;
       dirty=true;
@@ -256,44 +267,75 @@ async function pushLogToServer(record){
   }catch(err){ console.warn("推送日志失败，不影响本地", err); }
 }
 
-// ===== 超标噪声样本短录音（audio 轨道单独录，与录像 MediaRecorder 并行不冲突）=====
+// ===== 噪声样本：分段常驻录音（每段带头可播）+ 触发前判断（dB>背景才纳入、最多2秒） =====
 var audioClipRecorder = null;
-var audioClipChunks = [];
-function startRecordAudio(){
+var ringSeg = [];              // 当前录音段的片数组（每项 {db, blob}），样本从段头拼 → 可播
+var ringTimer = null;
+const RING_SLICE_MS = 1000;    // 分片/采样间隔（1 秒一片）
+const RING_RESTART_MS = 2000;  // 常态每 2 秒重建一段，保证触发前最多约 2 秒
+const LEAD_MAX_MS = 2000;      // 触发前最多向前 2 秒
+const LEAD_DB_OFFSET = 3;      // 触发前该段 dB 高于背景底噪这个量才算“不同于背景”，才纳入
+function ringStart(){
   if(!combinedStream) return;
   var at = combinedStream.getAudioTracks()[0];
   if(!at) return;
-  audioClipChunks = [];
+  var buf = [];                // 本 recorder 独立片数组（旧段收尾不会污染新段）
+  ringSeg = buf;
   var opts = { mimeType: "audio/webm" };
   if(!MediaRecorder.isTypeSupported(opts.mimeType)) opts = { mimeType: "" };
   try{
-    audioClipRecorder = new MediaRecorder(new MediaStream([at]), opts);
-    audioClipRecorder.ondataavailable = function(e){ if(e.data.size>0) audioClipChunks.push(e.data); };
-    audioClipRecorder.start(100);   // 每100ms一片，防短噪声丢数据
+    var rec = new MediaRecorder(new MediaStream([at]), opts);
+    rec.ondataavailable = function(e){ if(e.data && e.data.size>0) buf.push({ db: DB.value, blob: e.data }); };
+    rec.start(RING_SLICE_MS);
+    audioClipRecorder = rec;
   }catch(err){ audioClipRecorder = null; console.warn("噪声样本录音启动失败", err); }
+}
+function rebuildRing(){
+  if(audioClipRecorder && audioClipRecorder.state === "recording"){
+    var old = audioClipRecorder;
+    old.onstop = function(){ ringStart(); };   // 等旧段完全停止再开新段，杜绝重叠走样
+    old.stop();
+  } else {
+    ringStart();
+  }
+}
+function ensureRing(){
+  if(overSession.active) return;      // 事件期间不重建，保持事件段连续从头
+  if(audioClipRecorder && audioClipRecorder.state === "recording") rebuildRing();
+}
+function startRingRecording(){
+  if(!combinedStream) return;
+  ringStart();
+  if(ringTimer) clearInterval(ringTimer);
+  ringTimer = setInterval(ensureRing, RING_RESTART_MS);
+}
+function stopRingRecording(){
+  if(ringTimer){ clearInterval(ringTimer); ringTimer=null; }
+  if(audioClipRecorder){ try{ audioClipRecorder.stop(); }catch(e){} }
+  audioClipRecorder = null;
+  ringSeg = [];
 }
 function stopRecordAudio(){
   return new Promise(function(resolve){
-    if(!audioClipRecorder || audioClipRecorder.state === "inactive"){ resolve(null); return; }
-    audioClipRecorder.onstop = function(){
-      var blob = new Blob(audioClipChunks, {type: audioClipRecorder.mimeType || "audio/webm"});
-      var reader = new FileReader();
-      reader.onloadend = function(){ resolve(reader.result); };
-      reader.readAsDataURL(blob);
-    };
-    audioClipRecorder.stop();
+    if(!audioClipRecorder || !ringSeg.length){ resolve(null); return; }
+    // 当前段从头（带头片）拼 → 可正常播放；含触发前（需要时≤2秒）+ 事件时段
+    var blobs = [];
+    for(var k = 0; k < ringSeg.length; k++) blobs.push(ringSeg[k].blob);
+    var blob = new Blob(blobs, {type: audioClipRecorder.mimeType || "audio/webm"});
+    if(blob.size < 200){ resolve(null); return; }
+    var reader = new FileReader();
+    reader.onloadend = function(){ resolve(reader.result); };
+    reader.readAsDataURL(blob);
   });
 }
-
 async function closeAndSaveSession(){
   if(!overSession.active) return;
   var nowTs = Date.now();
   var durSec = ((nowTs - overSession.startTs)/1000).toFixed(1);
   var audioB64 = await stopRecordAudio();
   if(parseFloat(durSec) >= MIN_RECORD_SEC){
-    var waveImgB64 = $("scope").toDataURL("image/png");
     var fullTimeStr = formatFullTime(overSession.startTs);
-    putMedia(overSession.startTs, waveImgB64, audioB64); // 波形图+音频 → IndexedDB
+    putMedia(overSession.startTs, audioB64); // 音频 → IndexedDB
     logArr.unshift({
       timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
       peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
@@ -303,7 +345,8 @@ async function closeAndSaveSession(){
     saveLog(); renderLog();
     pushLogToServer({
       timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
-      peakDb: overSession.peakDb.toFixed(1), tag: getTag(), audioData: audioB64,
+      peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
+      audioData: validAudio(audioB64) ? audioB64 : null,
       lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
     });
   }
@@ -329,7 +372,6 @@ function processOverThreshold(currentDb){
     setThr();
     if(currentDb > triggerLevel && currentDb > thr){
       overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
-      startRecordAudio();   // 超标开始 → 录噪声样本
     }
   } else {
     var sessionDur = (nowTs - overSession.startTs)/1000;
@@ -401,17 +443,51 @@ function drawScope(){
   cv.width=w*dpr; cv.height=h*dpr;
   var c=cv.getContext("2d"); c.setTransform(dpr,0,0,dpr,0,0);
   c.fillStyle="#080C10"; c.fillRect(0,0,w,h);
-  c.strokeStyle="#14202A"; c.lineWidth=1; c.beginPath(); c.moveTo(0,h/2); c.lineTo(w,h/2); c.stroke();
-  if(!scopeBuf.length) return;
-  var maxAmp=0; for(var s of scopeBuf){ maxAmp=Math.max(maxAmp,Math.abs(s)); }
-  var minAmpFloor=0.04; var gain=Math.min(16, minAmpFloor/maxAmp || 1);
-  c.strokeStyle="#22D3EE"; c.lineWidth=1.6; c.beginPath();
-  var n=scopeBuf.length;
+  var DB_MIN=30, DB_MAX=90;
+  // 纵向 dB 刻度线（40/60/80）
+  c.strokeStyle="#14202A"; c.lineWidth=1;
+  c.fillStyle="#3A4A57"; c.font=Math.max(9,Math.round(w/70))+"px monospace";
+  for(var db=40; db<=80; db+=20){
+    var yy=h - ((db-DB_MIN)/(DB_MAX-DB_MIN))*(h*0.92);
+    c.beginPath(); c.moveTo(0,yy); c.lineTo(w,yy); c.stroke();
+    c.fillText(db+"dB", 3, yy-2);
+  }
+  // 横向时间刻度：5 分钟窗口（-5min … 现在）
+  for(var m=0;m<=5;m++){
+    var xx=(m/5)*w;
+    c.strokeStyle="#14202A"; c.beginPath(); c.moveTo(xx,0); c.lineTo(xx,h); c.stroke();
+    c.fillStyle="#3A4A57"; c.fillText("-"+(5-m)+"min", xx+2, h-4);
+  }
+  if(!scopeEnv.length) return;
+  // 5分钟 dB 包络线：最新在右，dB 越高凸起越高（从底部向上），突发噪声清晰可见
+  var n=scopeEnv.length;
+  c.strokeStyle="#22D3EE"; c.lineWidth=1.8; c.beginPath();
   for(var i=0;i<n;i++){
-    var scaled=scopeBuf[i]*gain, y=h/2 - scaled*(h/2)*0.92, x=i*(w/(n-1));
+    var dbv=Math.max(0,Math.min(1,(scopeEnv[i].db-DB_MIN)/(DB_MAX-DB_MIN)));
+    var age=(n-1-i)*100;               // 距当前毫秒数（每点100ms）
+    var x=w - (age/300000)*w;          // 5分钟窗口，最新贴右
+    var y=h - dbv*(h*0.92);
     if(i===0) c.moveTo(x,y); else c.lineTo(x,y);
   }
   c.stroke();
+  // 悬停参考线 + 时间/分贝提示
+  if(hoverX>=0){
+    var age2=Math.max(0, (w-hoverX)/w * 300000);
+    var idx=n-1 - Math.round(age2/100);
+    idx=Math.max(0,Math.min(n-1,idx));
+    var pt=scopeEnv[idx];
+    c.strokeStyle="rgba(245,166,35,0.85)"; c.lineWidth=1.2;
+    c.beginPath(); c.moveTo(hoverX,0); c.lineTo(hoverX,h); c.stroke();
+    var dbv2=Math.max(0,Math.min(1,(pt.db-DB_MIN)/(DB_MAX-DB_MIN)));
+    var py=h - dbv2*(h*0.92);
+    c.fillStyle="#F5A623"; c.beginPath(); c.arc(hoverX,py,3.5,0,6.283); c.fill();
+    var txt=formatFullTime(pt.t)+"  "+pt.db.toFixed(1)+" dB";
+    c.font=Math.max(10,Math.round(w/55))+"px monospace";
+    var tw=c.measureText(txt).width;
+    var tx=hoverX - tw - 10; if(tx<4) tx=4; if(tx+tw>w-4) tx=w-tw-4;
+    c.fillStyle="rgba(8,12,16,0.88)"; c.fillRect(tx-4,4,tw+8,18);
+    c.fillStyle="#F5A623"; c.fillText(txt,tx,17);
+  }
 }
 
 /* ---------- GPS ---------- */
@@ -544,30 +620,54 @@ function updateVideoStat(){
   $("videoStat").textContent=(recording?"录制中 ":"未录制 ")+segUploaded+" 段 · "+d+"s";
 }
 
+// 停止监测：释放摄像头/麦克风轨道，preview 停止出画面
+function releaseStream(){
+  if(combinedStream){
+    combinedStream.getTracks().forEach(function(t){ try{ t.stop(); }catch(e){} });
+    combinedStream = null;
+  }
+  var pv=$("preview");
+  if(pv) pv.srcObject = null;
+  soundLive = false;
+  $("dSound").className = "dot";
+  var st=$("sSound"); if(st){ st.textContent="已停止"; st.className="gstate"; }
+  if(audioCtx){ try{ audioCtx.close(); }catch(e){} audioCtx=null; analyser=null; micData=null; }
+  gGauge.f=0; gGauge.c="#22D3EE"; gGauge.t="--";
+  try{ drawArc($("gSound"),0,"#22D3EE","--"); }catch(e){}
+}
+
 /* ---------- 主控制：噪声监测 + 视频录制（点「开始监测」同时启动两者） ---------- */
-function startMonitor(){
-  if(running) return;
-  acquireWakeLock();
-  startGps();
-  resetOverSession();
+var startPending=false, stopPending=false;
+async function startMonitor(){
+  if(running || startPending) return;
+  startPending=true;
+  acquireWakeLock(); startGps(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0;
-  ensureStream().then(function(){
+  try{
+    await ensureStream();
+    if(stopPending){ stopPending=false; startPending=false; toast("已取消启动"); return; }
     running=true;
     $("btnStart").textContent="监测+录像中 · 停止";
     $("btnStart").className="btn red";
     if(audioCtx) audioCtx.resume();
-    startRecording();          // 录像随监测一并开始
+    await startRecording();            // 等录像完全建立，保证停止时能可靠停掉（避免启动中停止的竞态）
+    startRingRecording();               // 启动 1 分钟滑块缓存，噪声样本含触发前一段
     liveLoop();
-  }).catch(function(err){ toast("启动失败："+((err&&err.message)||"请检查 HTTPS 与权限")); });
+  }catch(err){ toast("启动失败："+((err&&err.message)||"请检查 HTTPS 与权限")); }
+  startPending=false;
 }
 async function stopMonitor(){
+  if(startPending){ stopPending=true; return; }   // 启动中：标记取消，等启动流程自行退出
   running=false;
   stopGps();
   $("btnStart").textContent="开始监测";
   $("btnStart").className="btn primary";
-  if(recording) await stopRecording();   // 录像随监测一并停止
+  if(recording) await stopRecording();            // 录像随监测一并停止
+  else if(videoRecorder && videoRecorder.state==="recording") videoRecorder.stop();
   if(audioCtx) audioCtx.suspend();
   await closeAndSaveSession();
+  stopRingRecording();                             // 停止滑块缓存录音
+  releaseStream();                                 // 释放摄像头/麦克风，preview 停止出画面
 }
 
 /* ---------- 日志渲染 ---------- */
@@ -616,7 +716,7 @@ function renderLog(){
     (function(ts, cell){
       if(ts==null) return;
       getMedia(ts).then(function(m){
-        if(!cell || !m || !m.audioData) return;
+        if(!cell || !m || !validAudio(m.audioData)) return;
         cell.innerHTML='<audio controls preload="none"><source src="'+m.audioData+'" type="audio/webm">不支持</audio>'+
           '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,5.0);">🔊×5</button>';
       }).catch(function(){});
@@ -626,7 +726,7 @@ function renderLog(){
 
 async function exportHtmlReport(){
   if(!logArr.length){ toast("暂无日志可导出"); return; }
-  // 从 IndexedDB 取回全部媒体（波形图+音频）
+  // 从 IndexedDB 取回全部音频媒体
   var mediaMap={};
   try{ (await getAllMedia()).forEach(function(m){ mediaMap[m.timeTs]=m; }); }catch(e){}
   var reportTitle="传感器噪声监测报告 "+new Date().toLocaleString();
@@ -634,8 +734,7 @@ async function exportHtmlReport(){
   for(var i=0;i<logArr.length;i++){
     var rec=logArr[i];
     var media=mediaMap[rec.timeTs]||{};
-    var audioData=media.audioData||null;
-    var waveImg=media.waveImg||null;
+    var audioData=validAudio(media.audioData) ? media.audioData : null;
     var audioHtml = audioData
       ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,5.0);">🔊×5放大播放</button>`
       : '<span style="color:#888">无录音片段</span>';
@@ -645,7 +744,6 @@ async function exportHtmlReport(){
   <td style="padding:6px 8px">${rec.durationSec||"N/A"} s</td>
   <td style="padding:6px 8px">${rec.peakDb} dB</td>
   <td style="padding:6px 8px">${audioHtml}</td>
-  <td style="padding:6px 8px">${waveImg?`<img src="${waveImg}" style="width:280px;border:1px solid #666;">`:'<span style="color:#888">无波形</span>'}</td>
   <td style="padding:6px 8px">${rec.lat??"--"}</td>
   <td style="padding:6px 8px">${rec.lon??"--"}</td>
 </tr>
@@ -681,7 +779,7 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
 </script>
 </head><body><h2>${reportTitle}</h2>
 <p>当前阈值：&gt;${thr} dB；最小记录时长：${MIN_RECORD_SEC}s；录像分片见后台 /review.html</p>
-<table><thead><tr><th>触发时间</th><th>标签</th><th>持续秒数</th><th>峰值dB</th><th>噪声录音</th><th>噪声波形截图</th><th>纬度</th><th>经度</th></tr></thead>
+<table><thead><tr><th>触发时间</th><th>标签</th><th>持续秒数</th><th>峰值dB</th><th>噪声录音</th><th>纬度</th><th>经度</th></tr></thead>
 <tbody>${rows}</tbody></table></body></html>`;
   var blob=new Blob([htmlOut],{type:"text/html;charset=utf-8"});
   var a=document.createElement("a");
@@ -693,10 +791,24 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
 
 /* ---------- 事件 ---------- */
 $("btnStart").addEventListener("click", async function(){
-  if(running){ await stopMonitor(); toast("监测与录像已停止"); } else startMonitor();
+  if(running){ await stopMonitor(); toast("监测与录像已停止"); } else await startMonitor();
 });
 $("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(); clearMedia(); saveLog(); renderLog(); toast("日志已清空"); });
 $("btnExport").addEventListener("click", exportHtmlReport);
+
+// 波形图 x 轴悬停：鼠标移动时显示该位置对应的年月日 时分秒 与分贝值
+(function(){
+  var sc=$("scope");
+  if(sc){
+    sc.addEventListener("mousemove", function(e){
+      var r=sc.getBoundingClientRect();
+      hoverX=e.clientX - r.left;
+      if(hoverX<0) hoverX=-1; else if(hoverX>r.width) hoverX=r.width;
+      drawScope();
+    });
+    sc.addEventListener("mouseleave", function(){ hoverX=-1; drawScope(); });
+  }
+})();
 
 setInterval(function(){ $("sssb").innerHTML="实时声波 - "+formatFullTime(new Date()); },1000);
 

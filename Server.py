@@ -446,6 +446,5 @@ if __name__ == "__main__":
     print(f'HTTPS server running on https://{ADDR[0]}:{ADDR[1]}')
     print(f"每日噪声日志目录：{LOG_DIR}/ ，文件名：noise_log_YYYY-MM-DD.html")
     print(f"录像存储目录：{VIDEO_DIR}/<设备指纹>/（webm 分片 + 合并的 10 分钟 MP4）")
-    print("录像回看页：https://<主机>:8088/review.html（优先播 MP4）")
-    print("⚠️噪声日志文件不会写入</tbody></table></html>，浏览器打开自动补全标签播放音频")
+    print("录像回看页：https://127.0.0.1:8088/review.html（优先播 MP4）")
     httpd.serve_forever()
