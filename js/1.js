@@ -89,6 +89,7 @@ function ensureStream(){
 
 // ================= 声压 / 噪声检测 =================
 var audioCtx=null, analyser=null, micData=null;
+var sampleSrc=null, sampleGain=null, sampleComp=null, sampleDest=null;
 var scopeBuf=[];
 var ltFz = 5 * 600; // N分钟
 var scopeEnv=[];   // 5分钟 dB 包络（每100ms一点），横轴呈现近5分钟突发噪声
@@ -117,6 +118,16 @@ function initAudioAnalysis(stream){
   analyser.smoothingTimeConstant = 0.12;
   src.connect(analyser);
   micData = new Float32Array(analyser.fftSize);
+  // 样本录音放大链：节点只建一次（避免分段重建反复创建节点导致累积/走样），
+  // 放大样本响度，使直接播放也能听到（原始响度偏低）
+  try{
+    sampleSrc = audioCtx.createMediaStreamSource(stream);
+    sampleGain = audioCtx.createGain(); sampleGain.gain.value = SAMPLE_GAIN;
+    sampleComp = audioCtx.createDynamicsCompressor();
+    sampleComp.threshold.value=-16; sampleComp.knee.value=10; sampleComp.ratio.value=6;
+    sampleDest = audioCtx.createMediaStreamDestination();
+    sampleSrc.connect(sampleGain); sampleGain.connect(sampleComp); sampleComp.connect(sampleDest);
+  }catch(e){ sampleDest = null; }
 }
 
 function computeDb(){
@@ -172,7 +183,7 @@ function getTag(){
   var v = ($("tagInput") && $("tagInput").value.trim()) || "未命名";
   v = v.replace(/[^\w\u4e00-\u9fff\-]/g, "_").slice(0,24);
   v = v || "未命名";
-  try{ localStorage.setItem("qs_video_tag", v); }catch(e){}
+  if(deviceId) try{ localStorage.setItem("qs_video_tag_"+deviceId, v); }catch(e){}
   return v;
 }
 
@@ -275,6 +286,7 @@ const RING_SLICE_MS = 1000;    // 分片/采样间隔（1 秒一片）
 const RING_RESTART_MS = 2000;  // 常态每 2 秒重建一段，保证触发前最多约 2 秒
 const LEAD_MAX_MS = 2000;      // 触发前最多向前 2 秒
 const LEAD_DB_OFFSET = 3;      // 触发前该段 dB 高于背景底噪这个量才算“不同于背景”，才纳入
+const SAMPLE_GAIN = 3;          // 样本录音放大增益（原始响度偏低，放大后直接播放可听）
 function ringStart(){
   if(!combinedStream) return;
   var at = combinedStream.getAudioTracks()[0];
@@ -284,7 +296,8 @@ function ringStart(){
   var opts = { mimeType: "audio/webm" };
   if(!MediaRecorder.isTypeSupported(opts.mimeType)) opts = { mimeType: "" };
   try{
-    var rec = new MediaRecorder(new MediaStream([at]), opts);
+    var recStream = (sampleDest && sampleDest.stream) ? sampleDest.stream : new MediaStream([at]);
+    var rec = new MediaRecorder(recStream, opts);
     rec.ondataavailable = function(e){ if(e.data && e.data.size>0) buf.push({ db: DB.value, blob: e.data }); };
     rec.start(RING_SLICE_MS);
     audioClipRecorder = rec;
@@ -647,11 +660,12 @@ async function startMonitor(){
     await ensureStream();
     if(stopPending){ stopPending=false; startPending=false; toast("已取消启动"); return; }
     running=true;
-    $("btnStart").textContent="监测+录像中 · 停止";
+    var wantVideo = !($("noVideoOpt") && $("noVideoOpt").checked);
+    $("btnStart").textContent = wantVideo ? "监测+录像中 · 停止" : "监测中 · 停止";
     $("btnStart").className="btn red";
     if(audioCtx) audioCtx.resume();
-    await startRecording();            // 等录像完全建立，保证停止时能可靠停掉（避免启动中停止的竞态）
-    startRingRecording();               // 启动 1 分钟滑块缓存，噪声样本含触发前一段
+    if(wantVideo) await startRecording(); // 默认录像；勾选“不录视频”则跳过视频录制
+    startRingRecording();                 // 启动样本录音缓存，噪声样本含触发前一段
     liveLoop();
   }catch(err){ toast("启动失败："+((err&&err.message)||"请检查 HTTPS 与权限")); }
   startPending=false;
@@ -690,7 +704,11 @@ async function playBoostAudio(dataUrl, boostGain){
     src.connect(g); g.connect(comp); comp.connect(_boostCtx.destination);
     src.onended=function(){ if(_boostCtx){ _boostCtx.close(); _boostCtx=null; } };
     src.start(0);
-  }catch(err){ alert("音频播放失败："+err.message); if(_boostCtx){ _boostCtx.close(); _boostCtx=null; } }
+  }catch(err){
+    console.warn("放大播放失败，改用原生播放", err);
+    try{ var _fa=new Audio(dataUrl); _fa.play(); }catch(e2){}
+    if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
+  }
 }
 // 暴露为全局，供动态生成的日志行内联 onclick 调用（js/1.js 在 IIFE 内，默认不挂到 window）
 window.playBoostAudio = playBoostAudio;
@@ -817,15 +835,31 @@ function toast(msg){
   clearTimeout(t._h); t._h=setTimeout(function(){ t.className="toast"; },2600);
 }
 
-// 录像标签自动记忆：输入即保存，下次打开同浏览器自动回填，避免每次重新输入
+// 录像标签/选项自动记忆：与设备指纹绑定，永久保存；指纹就绪后回填
+function applyMem(){
+  if(!deviceId) return;
+  try{
+    var _ti=$("tagInput"); if(_ti){
+      var _sv=localStorage.getItem("qs_video_tag_"+deviceId);
+      if(_sv){ _ti.value=_sv; }
+      else { var _old=localStorage.getItem("qs_video_tag"); if(_old){ _ti.value=_old; localStorage.setItem("qs_video_tag_"+deviceId,_old); localStorage.removeItem("qs_video_tag"); } }
+    }
+    var _nv=$("noVideoOpt"); if(_nv){
+      _nv.checked = localStorage.getItem("qs_novideo_"+deviceId) === "1";
+    }
+  }catch(e){}
+}
 (function(){
   var _ti=$("tagInput");
-  if(_ti){
-    try{ var _sv=localStorage.getItem("qs_video_tag"); if(_sv) _ti.value=_sv; }catch(e){}
-    _ti.addEventListener("input", function(){
-      try{ localStorage.setItem("qs_video_tag", _ti.value.trim()); }catch(e){}
-    });
-  }
+  if(_ti) _ti.addEventListener("input", function(){
+    if(deviceId) try{ localStorage.setItem("qs_video_tag_"+deviceId, _ti.value.trim()); }catch(e){}
+  });
+  var _nv=$("noVideoOpt");
+  if(_nv) _nv.addEventListener("change", function(){
+    if(deviceId) try{ localStorage.setItem("qs_novideo_"+deviceId, _nv.checked ? "1":"0"); }catch(e){}
+  });
+  if(deviceId) applyMem();
+  else getDeviceFingerprint().then(applyMem);
 })();
 
 // 初始化：计算设备指纹、绘制空表
