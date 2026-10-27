@@ -41,16 +41,15 @@ header{padding:14px 0 10px;display:flex;align-items:center;justify-content:space
 .dashboard.cols-3{grid-template-columns:repeat(3,1fr)}
 .dashboard .card, .dashboard .zone{min-width:0;margin-top:0}
 /* 声压卡作为尺寸容器，dB 数字用容器查询单位自适应（不写死，随列宽缩放） */
-.card{container-type:inline-size}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 8px 6px;min-width:0}
-.card .h{display:flex;justify-content:space-between;align-items:center;gap:6px}
+.card{container-type:inline-size;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 8px 6px;min-width:0}
+.card .h{display:flex;justify-content:center;align-items:center;gap:6px;width:100%;flex:0 0 auto}
 .card .h .nm{font-size:12px;color:var(--muted);font-weight:600}
 .card .h .dot{width:8px;height:8px;border-radius:50%;background:var(--line)}
 .card .h .dot.live{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,.7);animation:pulse 1.6s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.gauge{position:relative;display:block;margin:6px 0 0;width:100%}
+.gauge{position:relative;flex:1 1 auto;display:flex;align-items:center;justify-content:center;margin:6px 0 0;width:100%;min-height:80px}
 .gauge canvas{display:block;width:100%;aspect-ratio:1.6/1;height:auto}
-.gstate{text-align:center;font-size:11px;color:var(--muted);margin-top:4px;min-height:15px}
+.gstate{text-align:center;font-size:11px;color:var(--muted);margin-top:4px;min-height:15px;flex:0 0 auto}
 .gstate.warn{color:var(--amber)}
 .gstate.alarm{color:var(--red);font-weight:600}
 .compass-read{text-align:center;font-family:var(--mono);font-size:13px;margin-top:6px;color:var(--text)}
@@ -106,7 +105,7 @@ tbody tr.alarm{background:rgba(239,68,68,.05)}
 .empty{color:var(--muted);text-align:center;padding:22px 10px;font-size:12px}
 /* ===== 录像区 ===== */
 .zone.video .z-h .nm{font-size:13px;font-weight:700}
-video#preview{display:block;width:100%;max-height:360px;background:#000;border-radius:8px;border:1px solid var(--line);margin-top:8px;object-fit:cover}
+video#preview{display:block;width:100%;height:auto;max-height:360px;background:#000;border-radius:8px;border:1px solid var(--line);margin-top:8px;object-fit:contain}
 .zone.video .meta{margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--muted)}
 .zone.video .meta .sub{display:block;word-break:break-all}
 /* ===== 说明 ===== */

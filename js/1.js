@@ -660,11 +660,11 @@ async function startMonitor(){
     await ensureStream();
     if(stopPending){ stopPending=false; startPending=false; toast("已取消启动"); return; }
     running=true;
-    var wantVideo = !($("noVideoOpt") && $("noVideoOpt").checked);
+    var wantVideo = !($("videoOpt") && !$("videoOpt").checked);   // 默认勾选=录视频
     $("btnStart").textContent = wantVideo ? "监测+录像中 · 停止" : "监测中 · 停止";
     $("btnStart").className="btn red";
     if(audioCtx) audioCtx.resume();
-    if(wantVideo) await startRecording(); // 默认录像；勾选“不录视频”则跳过视频录制
+    if(wantVideo) await startRecording(); // 默认录视频；去勾选则跳过视频录制
     startRingRecording();                 // 启动样本录音缓存，噪声样本含触发前一段
     liveLoop();
   }catch(err){ toast("启动失败："+((err&&err.message)||"请检查 HTTPS 与权限")); }
@@ -835,6 +835,13 @@ function toast(msg){
   clearTimeout(t._h); t._h=setTimeout(function(){ t.className="toast"; },2600);
 }
 
+// “录视频”勾选状态 → 控制视频区显示。只隐藏视频画面/标题/统计，保留 .set（含“录视频”复选框）始终可操作
+function syncVideoArea(){
+  var wantVideo = $("videoOpt") ? $("videoOpt").checked : true;
+  var z=$("videoZone"); if(!z) return;
+  var secs=z.querySelectorAll(".z-h,#preview,.meta");
+  for(var i=0;i<secs.length;i++) secs[i].style.display = wantVideo ? "" : "none";
+}
 // 录像标签/选项自动记忆：与设备指纹绑定，永久保存；指纹就绪后回填
 function applyMem(){
   if(!deviceId) return;
@@ -844,9 +851,16 @@ function applyMem(){
       if(_sv){ _ti.value=_sv; }
       else { var _old=localStorage.getItem("qs_video_tag"); if(_old){ _ti.value=_old; localStorage.setItem("qs_video_tag_"+deviceId,_old); localStorage.removeItem("qs_video_tag"); } }
     }
-    var _nv=$("noVideoOpt"); if(_nv){
-      _nv.checked = localStorage.getItem("qs_novideo_"+deviceId) === "1";
+    var _vt=$("videoOpt"); if(_vt){
+      var _mv=localStorage.getItem("qs_video_"+deviceId);
+      if(_mv!=null){ _vt.checked = (_mv === "1"); }
+      else {
+        var _old=localStorage.getItem("qs_novideo_"+deviceId);
+        if(_old!=null){ _vt.checked = (_old !== "1"); localStorage.removeItem("qs_novideo_"+deviceId); }
+        else { _vt.checked = true; }   // 默认录视频
+      }
     }
+    syncVideoArea();
   }catch(e){}
 }
 (function(){
@@ -854,9 +868,10 @@ function applyMem(){
   if(_ti) _ti.addEventListener("input", function(){
     if(deviceId) try{ localStorage.setItem("qs_video_tag_"+deviceId, _ti.value.trim()); }catch(e){}
   });
-  var _nv=$("noVideoOpt");
-  if(_nv) _nv.addEventListener("change", function(){
-    if(deviceId) try{ localStorage.setItem("qs_novideo_"+deviceId, _nv.checked ? "1":"0"); }catch(e){}
+  var _vt=$("videoOpt");
+  if(_vt) _vt.addEventListener("change", function(){
+    if(deviceId) try{ localStorage.setItem("qs_video_"+deviceId, _vt.checked ? "1":"0"); }catch(e){}
+    syncVideoArea();
   });
   if(deviceId) applyMem();
   else getDeviceFingerprint().then(applyMem);

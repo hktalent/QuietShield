@@ -27,7 +27,7 @@
       <div class="gauge"><canvas id="gSound"></canvas></div>
       <div class="gstate" id="sSound">等待麦克风</div>
     </div>
-    <section class="zone video">
+    <section class="zone video" id="videoZone">
       <div class="z-h">
         <span class="nm">前置摄像头录像</span>
         <span class="cnt" id="videoStat">未录制 · 0 段</span>
@@ -36,7 +36,7 @@
       <div class="set">
         <label for="tagInput">录像标签</label>
         <input type="text" id="tagInput" placeholder="如：客厅、卧室" maxlength="24" autocomplete="off">
-        <label class="opt" for="noVideoOpt"><input type="checkbox" id="noVideoOpt">不录视频（默认录像）</label>
+        <label class="opt" for="videoOpt"><input type="checkbox" id="videoOpt" checked>录视频</label>
       </div>
       <div class="meta">
         <span id="sessionId" class="sub">会话：--</span>
