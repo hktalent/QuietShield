@@ -516,17 +516,41 @@ function startGps(){
 function stopGps(){ if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
 
 /* ---------- 屏幕常亮 ---------- */
+var wakeLockTimer=null;
 async function acquireWakeLock(){
-  if(!("wakeLock" in navigator)){ toast("当前版本不支持网页常亮，请设置系统自动锁定为「永不」"); return; }
+  if(!("wakeLock" in navigator)){
+    toast("⚠️当前浏览器不支持网页常亮，请在手机系统设置把自动锁屏设为「永不」或「充电时常亮」");
+    return;
+  }
   try{
     wakeLockSentinel = await navigator.wakeLock.request('screen');
-    toast("✅已开启屏幕常亮");
+    try{ wakeLockSentinel.addEventListener('release', function(){}); }catch(e){}
+    if(wakeLockTimer) clearInterval(wakeLockTimer);
+    // 浏览器节能可能自动释放 Wake Lock，每 60 秒重新获取一次，保证长时间运行不掉屏
+    wakeLockTimer = setInterval(function(){
+      if(document.visibilityState === 'visible'){
+        navigator.wakeLock.request('screen').then(function(s){
+          try{ if(wakeLockSentinel && wakeLockSentinel.release) wakeLockSentinel.release(); }catch(e){}
+          wakeLockSentinel = s;
+        }).catch(function(){});
+      }
+    }, 60000);
     document.addEventListener('visibilitychange', async function(){
-      if(wakeLockSentinel!==null && document.visibilityState==='visible'){
+      if(document.visibilityState==='visible'){
         try{ wakeLockSentinel = await navigator.wakeLock.request('screen'); }catch(e){}
       }
     });
-  }catch(err){ toast("⚠️无法获取屏幕常亮："+err.message); wakeLockSentinel=null; }
+  }catch(err){
+    toast("⚠️无法获取屏幕常亮："+err.message+"，请在系统设置把自动锁屏设为「永不」或「充电时常亮」");
+    wakeLockSentinel=null;
+  }
+}
+function releaseWakeLock(){
+  if(wakeLockTimer){ clearInterval(wakeLockTimer); wakeLockTimer=null; }
+  if(wakeLockSentinel && wakeLockSentinel.release){
+    try{ wakeLockSentinel.release(); }catch(e){}
+  }
+  wakeLockSentinel=null;
 }
 
 /* ================= 前置摄像头录像：独立可播分片 + 实时上传 ================= */
@@ -681,6 +705,7 @@ async function stopMonitor(){
   if(audioCtx) audioCtx.suspend();
   await closeAndSaveSession();
   stopRingRecording();                             // 停止滑块缓存录音
+  releaseWakeLock();                                // 释放屏幕常亮，监测停止后可正常休眠
   releaseStream();                                 // 释放摄像头/麦克风，preview 停止出画面
 }
 
