@@ -42,6 +42,27 @@ def get_daily_log_filename():
     return os.path.join(LOG_DIR, f"noise_log_{today}.html")
 
 
+def get_early_morning_log_filename():
+    """凌晨(01:00~06:00)单独日志文件，文件名含时段起止(0100-0600)"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(LOG_DIR, f"noise_log_{today}_凌晨0100-0600.html")
+
+
+MAX_LOG_BYTES = 100 * 1024 * 1024  # 日志滚动阈值：单文件不超过 100MB
+
+
+def get_log_write_path(base_path):
+    """日志滚动：单文件超过 100MB 则切到 文件名_01 ... _0N（保留 header 继承）"""
+    if not os.path.exists(base_path) or os.path.getsize(base_path) < MAX_LOG_BYTES:
+        return base_path
+    idx = 1
+    while True:
+        cand = base_path.replace(".html", f"_{idx:02d}.html")
+        if not os.path.exists(cand) or os.path.getsize(cand) < MAX_LOG_BYTES:
+            return cand
+        idx += 1
+
+
 def extract_mime_from_dataurl(dataurl):
     """从dataURL字符串提取mime类型"""
     if not dataurl or not dataurl.startswith("data:"):
@@ -324,7 +345,7 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.wfile.write(json.dumps({"ok": True, "sessions": sessions}).encode("utf-8"))
 
     def _handle_noise_log(self):
-        html_log_path = get_daily_log_filename()
+        html_log_path = get_log_write_path(get_daily_log_filename())
         self._init_daily_html_log(html_log_path)
 
         length = int(self.headers["Content-Length"])
@@ -372,6 +393,18 @@ class MyHandler(SimpleHTTPRequestHandler):
         with _io_lock:
             with open(html_log_path, "a", encoding="utf-8") as f:
                 f.write(tr_html)
+
+        # 凌晨 01:00~06:00 的记录：额外单独存一份凌晨文件（文件名含时段起止）
+        try:
+            _eh = int(str(payload.get("timeText", "")).split(" ")[1].split(":")[0])
+        except Exception:
+            _eh = -1
+        if 1 <= _eh < 6:
+            early_path = get_log_write_path(get_early_morning_log_filename())
+            self._init_daily_html_log(early_path)
+            with _io_lock:
+                with open(early_path, "a", encoding="utf-8") as f:
+                    f.write(tr_html)
 
         self.send_response(200)
         self._set_cors()
