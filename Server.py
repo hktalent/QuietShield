@@ -375,8 +375,9 @@ class MyHandler(SimpleHTTPRequestHandler):
         lat = html.escape(str(payload.get("lat", "--")))
         lon = html.escape(str(payload.get("lon", "--")))
 
+        timeTs_esc = html.escape(str(payload.get("timeTs", "")))
         tr_html = (
-            f"<tr>"
+            f'<tr id="log-{timeTs_esc}">'
             f"<td>{timeText}</td>"
             f"<td>{tag}</td>"
             f"<td>{durSec}</td>"
@@ -412,6 +413,41 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         resp = json.dumps({"ok": True, "logfile": os.path.basename(html_log_path)})
         self.wfile.write(resp.encode("utf-8"))
+
+    def _handle_log_delete(self, parsed):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            payload = {}
+        ts = safe_token(str(payload.get("timeTs", "")), fallback="")
+        removed = 0
+        if ts:
+            pat = re.compile(r'<tr\s+id="log-' + re.escape(ts) + r'"[^>]*>.*?</tr>', re.DOTALL)
+            with _io_lock:
+                for fn in os.listdir(LOG_DIR):
+                    if not fn.startswith("noise_log_") or not fn.endswith(".html"):
+                        continue
+                    p = os.path.join(LOG_DIR, fn)
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    except Exception:
+                        continue
+                    newc, n = pat.subn("", content)
+                    if n:
+                        try:
+                            with open(p, "w", encoding="utf-8") as f:
+                                f.write(newc)
+                        except Exception:
+                            continue
+                        removed += n
+        self.send_response(200)
+        self._set_cors()
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": True, "removed": removed}).encode("utf-8"))
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -450,6 +486,9 @@ class MyHandler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/log":
                 self._handle_noise_log()
+                return
+            if path == "/api/log/del":
+                self._handle_log_delete(parsed)
                 return
             super().do_POST()
         except Exception as e:

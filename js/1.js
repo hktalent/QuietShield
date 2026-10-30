@@ -247,6 +247,16 @@ function clearMedia(){
     });
   }).catch(function(){});
 }
+function deleteMedia(timeTs){
+  if(timeTs==null) return Promise.resolve();
+  return openDB().then(function(db){
+    return new Promise(function(res,rej){
+      var tx=db.transaction("media","readwrite");
+      tx.objectStore("media").delete(timeTs);
+      tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
+    });
+  }).catch(function(e){ console.warn("媒体删除失败",e); });
+}
 
 function validAudio(a){
   return typeof a === "string" && a.length > 400 && a.indexOf("base64,") > 0;
@@ -751,7 +761,7 @@ window.playBoostAudio = playBoostAudio;
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
   var b=$("logBody");
-  if(!logArr.length){ b.innerHTML='<tr><td colspan="7" class="empty">尚无记录。</td></tr>'; return; }
+  if(!logArr.length){ b.innerHTML='<tr><td colspan="8" class="empty">尚无记录。</td></tr>'; return; }
   b.innerHTML="";
   for(var i=0;i<logArr.length;i++){
     var r=logArr[i];
@@ -763,7 +773,8 @@ function renderLog(){
       '<td>'+r.peakDb+'</td>'+
       '<td class="au"><span class="muted">—</span></td>'+
       '<td>'+(r.lat??"--")+'</td>'+
-      '<td>'+(r.lon??"--")+'</td>';
+      '<td>'+(r.lon??"--")+'</td>'+
+      '<td><button type="button" class="au-btn del-btn">删除</button></td>';
     b.appendChild(tr);
     // 音频从 IndexedDB 异步取回，取到后填充播放控件
     (function(ts, cell){
@@ -774,7 +785,22 @@ function renderLog(){
           '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,5.0);">🔊×5</button>';
       }).catch(function(){});
     })(r.timeTs, tr.querySelector(".au"));
+    // 删除本行：同步删前端(IndexedDB+列表)并通知后端删除对应日志
+    (function(ts, btn){
+      if(btn) btn.addEventListener("click", function(){ delLog(ts); });
+    })(r.timeTs, tr.querySelector(".del-btn"));
   }
+}
+
+async function delLog(ts){
+  if(ts==null) return;
+  if(!confirm("确定删除这条日志？后端对应记录也会删除。")) return;
+  try{ await fetch("/api/log/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({timeTs:String(ts)})}); }
+  catch(e){ console.warn("删除后端日志失败", e); }
+  logArr = logArr.filter(function(x){ return x.timeTs !== ts; });
+  try{ deleteMedia(ts); }catch(e){}
+  saveLog(); renderLog();
+  toast("已删除该条日志");
 }
 
 async function exportHtmlReport(){
