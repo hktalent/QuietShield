@@ -106,7 +106,10 @@ var running=false;
 var noiseFloorDb = 30;
 var noiseFloorSamples = 0;
 var noiseFloorSum = 0;
-var noiseFloorCalSec = 2;   // 背景噪声校准时长(秒)：凌晨 1-6 点延长到 10s 更稳
+var noiseFloorCalSec = 2;   // 背景噪声校准时长(秒)：凌晨 1-6 点 20s、其他 10s
+var calArr = [];                    // 校准期 dB 样本，用低分位数抗偶发噪声污染
+var postSessionCooldownTs = 0;      // 事件结束时间戳，用于冷却期
+const POST_SESSION_COOLDOWN_MS = 5000;  // 事件结束后 5 秒内不更新背景，防刚停的噪声拉高背景
 var NOISE_FLOOR_ALPHA = 0.02;
 
 function initAudioAnalysis(stream){
@@ -154,11 +157,13 @@ function computeDb(){
 
   if(!overSession.active){
     if(noiseFloorSamples < noiseFloorCalSec*10){
-      noiseFloorSum += db; noiseFloorSamples++;
+      calArr.push(db); noiseFloorSamples++;
       if(noiseFloorSamples === noiseFloorCalSec*10){
-        noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, noiseFloorSum/noiseFloorSamples));
+        // 低分位数(第20百分位)作为背景，抗校准期内偶发噪声污染
+        var _ca = calArr.slice().sort(function(a,b){return a-b;});
+        noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, _ca[Math.floor(_ca.length*0.2)]));
       }
-    } else if(db < noiseFloorDb + 3){
+    } else if(Date.now()-postSessionCooldownTs > POST_SESSION_COOLDOWN_MS && db < noiseFloorDb + 3){
       noiseFloorDb = noiseFloorDb*(1-NOISE_FLOOR_ALPHA) + db*NOISE_FLOOR_ALPHA;
       noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, noiseFloorDb));
     }
@@ -363,6 +368,7 @@ async function closeAndSaveSession(){
     audioData: audioB64,
     lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
   });
+  postSessionCooldownTs = Date.now();  // 事件结束进入 5 秒冷却，期内不更新背景
   resetOverSession();
 }
 
@@ -370,7 +376,7 @@ async function closeAndSaveSession(){
 var fallTs = null;
 const TRIG_OFFSET = 6;
 const HOLD_AFTER_FALL = 0.4;
-const MAX_SESSION_SEC = 12;
+const MAX_SESSION_SEC = 600;   // 连续噪声持续记录，仅真正回落才结束；10 分钟兜底防音频无限
 
 function setThr(){
   var h = new Date().getHours();
@@ -682,8 +688,8 @@ async function startMonitor(){
   if(running || startPending) return;
   startPending=true;
   acquireWakeLock(); startGps(); resetOverSession();
-  noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0;
-  var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 10 : 2;  // 凌晨 1-6 点用 10s 校准背景
+  noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0; calArr=[]; postSessionCooldownTs=0;
+  var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 20 : 10;  // 凌晨 1-6 点 20s，其他 10s
   try{
     await ensureStream();
     if(stopPending){ stopPending=false; startPending=false; toast("已取消启动"); return; }
