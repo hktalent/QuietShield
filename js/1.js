@@ -775,9 +775,13 @@ async function playBoostAudio(dataUrl, boostGain){
     var src=_boostCtx.createBufferSource(); src.buffer=ab;
     var g=_boostCtx.createGain(); g.gain.value=boostGain;
     var comp=_boostCtx.createDynamicsCompressor();
-    comp.threshold.value=-18; comp.knee.value=10; comp.ratio.value=4;
-    comp.attack.value=0.003; comp.release.value=0.25;
-    src.connect(g); g.connect(comp); comp.connect(_boostCtx.destination);
+    // limiter：只在接近 -6dBFS 防削波，不再抬低响度背景（避免×5播放时背景嗡嗡更响）
+    comp.threshold.value=-6; comp.knee.value=2; comp.ratio.value=20;
+    comp.attack.value=0.002; comp.release.value=0.2;
+    // 高通：滤掉低频"嗡嗡"背景（对旧样本同样有效）
+    var hp=_boostCtx.createBiquadFilter();
+    hp.type="highpass"; hp.frequency.value=150; hp.Q.value=0.7;
+    src.connect(g); g.connect(hp); hp.connect(comp); comp.connect(_boostCtx.destination);
     src.onended=function(){ if(_boostCtx){ _boostCtx.close(); _boostCtx=null; } };
     src.start(0);
   }catch(err){
@@ -879,9 +883,13 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
     const src=playBoostAudioCtx.createBufferSource(); src.buffer=ab;
     const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
     const comp=playBoostAudioCtx.createDynamicsCompressor();
-    comp.threshold.value=-18; comp.knee.value=10; comp.ratio.value=4;
-    comp.attack.value=0.003; comp.release.value=0.25;
-    src.connect(g); g.connect(comp); comp.connect(playBoostAudioCtx.destination);
+    // limiter：只在接近 -6dBFS 防削波，不再抬低响度背景（避免×5播放时背景嗡嗡更响）
+    comp.threshold.value=-6; comp.knee.value=2; comp.ratio.value=20;
+    comp.attack.value=0.002; comp.release.value=0.2;
+    // 高通：滤掉低频"嗡嗡"背景（对旧样本同样有效）
+    const hp=playBoostAudioCtx.createBiquadFilter();
+    hp.type="highpass"; hp.frequency.value=150; hp.Q.value=0.7;
+    src.connect(g); g.connect(hp); hp.connect(comp); comp.connect(playBoostAudioCtx.destination);
     src.onended=()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } };
     src.start(0);
   }catch(err){ alert("音频播放失败："+err.message); if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } }

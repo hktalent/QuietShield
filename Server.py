@@ -136,7 +136,6 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
 <th>纬度</th>
 <th>经度</th>
 <th>录音</th>
-<th>录像标签</th>
 <th>客户端IP</th>
 <th>UA</th>
 </tr>
@@ -400,7 +399,6 @@ class MyHandler(SimpleHTTPRequestHandler):
             f"<td>{lat}</td>"
             f"<td>{lon}</td>"
             f"<td>{audio_html}</td>"
-            f"<td>{tag}</td>"
             f"<td>{remote_ip}</td>"
             f'<td title="{ua}">{ua_disp}</td>'
             f"</tr>\n"
