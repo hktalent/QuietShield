@@ -376,7 +376,7 @@ async function closeAndSaveSession(){
 var fallTs = null;
 const TRIG_OFFSET = 6;
 const HOLD_AFTER_FALL = 0.4;
-const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 1 分钟一段，超时切段重记
+const MAX_SESSION_SEC = 120;   // 连续噪声记录上限：最多 2 分钟一段，超时切段重记
 
 function setThr(){
   var h = new Date().getHours();
