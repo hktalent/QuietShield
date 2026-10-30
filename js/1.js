@@ -4,7 +4,7 @@
 // 底噪上下限，防止漂移
 const MIN_NOISE_FLOOR = 25;
 const MAX_NOISE_FLOOR = 60;
-const CAL = 103;
+const CAL = 93;   // 校准偏移：由 103 降至 93，使读数整体下移约 10dB，与手机声贝 app 接近
 const DB_OFFSET = 94;
 
 var wakeLockSentinel = null;
@@ -89,7 +89,8 @@ function ensureStream(){
 
 // ================= 声压 / 噪声检测 =================
 var audioCtx=null, analyser=null, micData=null;
-var sampleSrc=null, sampleGain=null, sampleComp=null, sampleDest=null;
+var sampleSrc=null, sampleGain=null, sampleHp=null, sampleComp=null, sampleDest=null;
+const SAMPLE_HP_FREQ = 120;   // 样本高通切除频点：滤掉低频"嗡嗡"背景（电源/电机低频），保留震楼器撞击瞬态
 var scopeBuf=[];
 var ltFz = 5 * 600; // N分钟
 var scopeEnv=[];   // 5分钟 dB 包络（每100ms一点），横轴呈现近5分钟突发噪声
@@ -106,7 +107,7 @@ var running=false;
 var noiseFloorDb = 30;
 var noiseFloorSamples = 0;
 var noiseFloorSum = 0;
-var noiseFloorCalSec = 2;   // 背景噪声校准时长(秒)：凌晨 1-6 点 20s、其他 10s
+var noiseFloorCalSec = 2;   // 背景噪声校准时长(秒)，启动时按小时设置：凌晨 1-6 点 10s、白天 2s
 var calArr = [];                    // 校准期 dB 样本，用低分位数抗偶发噪声污染
 var postSessionCooldownTs = 0;      // 事件结束时间戳，用于冷却期
 const POST_SESSION_COOLDOWN_MS = 5000;  // 事件结束后 5 秒内不更新背景，防刚停的噪声拉高背景
@@ -125,11 +126,15 @@ function initAudioAnalysis(stream){
   // 放大样本响度，使直接播放也能听到（原始响度偏低）
   try{
     sampleSrc = audioCtx.createMediaStreamSource(stream);
+    sampleHp = audioCtx.createBiquadFilter();
+    sampleHp.type="highpass"; sampleHp.frequency.value=SAMPLE_HP_FREQ; sampleHp.Q.value=0.7;
     sampleGain = audioCtx.createGain(); sampleGain.gain.value = SAMPLE_GAIN;
     sampleComp = audioCtx.createDynamicsCompressor();
-    sampleComp.threshold.value=-16; sampleComp.knee.value=10; sampleComp.ratio.value=6;
+    // 压缩器改 limiter：只在响度到 -10dBFS 附近开始限幅防削波，不把低响度背景抬起来（避免样本播放时背景嘈杂）
+    sampleComp.threshold.value=-10; sampleComp.knee.value=4; sampleComp.ratio.value=10;
+    sampleComp.attack.value=0.003; sampleComp.release.value=0.25;
     sampleDest = audioCtx.createMediaStreamDestination();
-    sampleSrc.connect(sampleGain); sampleGain.connect(sampleComp); sampleComp.connect(sampleDest);
+    sampleSrc.connect(sampleGain); sampleGain.connect(sampleHp); sampleHp.connect(sampleComp); sampleComp.connect(sampleDest);
   }catch(e){ sampleDest = null; }
 }
 
@@ -159,9 +164,13 @@ function computeDb(){
     if(noiseFloorSamples < noiseFloorCalSec*10){
       calArr.push(db); noiseFloorSamples++;
       if(noiseFloorSamples === noiseFloorCalSec*10){
-        // 低分位数(第20百分位)作为背景，抗校准期内偶发噪声污染
+        // 背景代表值：凌晨安静→用中位数(抗偶发噪声)；白天→用平均值(常态噪声，避免平时噪声贴近触发线导致不回落)
         var _ca = calArr.slice().sort(function(a,b){return a-b;});
-        noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, _ca[Math.floor(_ca.length*0.2)]));
+        var _hc2 = new Date().getHours(), _early2 = (_hc2 >= 1 && _hc2 < 6);
+        var _bv;
+        if(_early2){ _bv = _ca[Math.floor(_ca.length/2)]; }
+        else { var _sum2=0; for(var _m2=0;_m2<_ca.length;_m2++) _sum2 += _ca[_m2]; _bv = _sum2/_ca.length; }
+        noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, _bv));
       }
     } else if(Date.now()-postSessionCooldownTs > POST_SESSION_COOLDOWN_MS && db < noiseFloorDb + 3){
       noiseFloorDb = noiseFloorDb*(1-NOISE_FLOOR_ALPHA) + db*NOISE_FLOOR_ALPHA;
@@ -385,6 +394,8 @@ async function closeAndSaveSession(){
 /* ===== 超标检测 ===== */
 var fallTs = null;
 const TRIG_OFFSET = 6;
+const RELEASE_OFFSET = 3;   // 结束线 = 背景 + 3dB（低于触发线 6dB），噪声真正回落到常态附近才停
+const RELEASE_HYSTERESIS = 5;   // 白天/夜间结束线比触发线低 5dB（滞回）：常态噪声在阈值附近波动也能正常结束
 const HOLD_AFTER_FALL = 0.4;
 const MAX_SESSION_SEC = 120;   // 连续噪声记录上限：最多 2 分钟一段，超时切段重记
 
@@ -395,21 +406,24 @@ function setThr(){
 function processOverThreshold(currentDb){
   var nowTs = Date.now();
   var triggerLevel = noiseFloorDb + TRIG_OFFSET;
+  var hh = new Date().getHours();
+  var early = (hh >= 1 && hh < 6);   // 凌晨 01:00~06:00 前
   if(!overSession.active){
     fallTs = null;
     if(noiseFloorSamples < noiseFloorCalSec*10) return;
     setThr();
-    var hh = new Date().getHours();
-    // 凌晨 01:00~06:00 前：保留原逻辑（超固定阈值就记录），同时噪声比背景声高 6dB 也记录（两者任一满足即触发）
-    var early = (hh >= 1 && hh < 6);
-    if((early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > triggerLevel && currentDb > thr))){
+    // 触发：凌晨 = 原固定阈值(45dB) 或 噪声比背景高6dB（任一即触发）；
+    //      其他时段 = 仅固定阈值（白天>55 / 夜间>45），不再用背景+6
+    if(early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr)){
       overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
     }
   } else {
     var sessionDur = (nowTs - overSession.startTs)/1000;
     if(sessionDur >= MAX_SESSION_SEC){ closeAndSaveSession(); return; }
     if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
-    if(currentDb > triggerLevel){ fallTs=null; }
+    // 结束线：凌晨 = 背景+3（噪声真正回落到常态附近才停）；其他时段 = 固定阈值（降到阈值以下即结束）
+    var releaseLevel = early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS);   // 凌晨=背景+3；白天/夜间=阈值-5dB滞回
+    if(currentDb > releaseLevel){ fallTs=null; }
     else {
       if(fallTs===null) fallTs=nowTs;
       else if((nowTs-fallTs)/1000 >= HOLD_AFTER_FALL) closeAndSaveSession();
@@ -526,11 +540,28 @@ function drawScope(){
 var gpsLat=null, gpsLon=null, gpsWatchId=null;
 function startGps(){
   if(!navigator.geolocation || gpsWatchId!==null) return;
-  gpsWatchId = navigator.geolocation.watchPosition(
-    function(pos){ gpsLat=pos.coords.latitude; gpsLon=pos.coords.longitude; },
-    function(err){ console.warn("GPS失败",err); },
-    { enableHighAccuracy:true, maximumAge:30000, timeout:15000 }
-  );
+  // macOS 无 GPS 硬件，enableHighAccuracy 请求可能挂起/超时：高精度失败自动降级标准定位，再失败 getCurrentPosition 兜底
+  var tryWatch = function(highAcc){
+    gpsWatchId = navigator.geolocation.watchPosition(
+      function(pos){ gpsLat=pos.coords.latitude; gpsLon=pos.coords.longitude; },
+      function(err){
+        console.warn("GPS失败 code=", err.code, err.message);
+        if(gpsWatchId!==null){ try{ navigator.geolocation.clearWatch(gpsWatchId); }catch(e){} gpsWatchId=null; }
+        if(highAcc){ tryWatch(false); }
+        else {
+          try{
+            navigator.geolocation.getCurrentPosition(
+              function(pos){ gpsLat=pos.coords.latitude; gpsLon=pos.coords.longitude; },
+              function(e2){ console.warn("GPS最终失败", e2); toast("⚠️定位失败：请检查系统「定位服务」已为浏览器开启并授予位置权限"); },
+              { maximumAge:60000, timeout:20000 }
+            );
+          }catch(e){ toast("⚠️定位失败：请检查系统定位权限"); }
+        }
+      },
+      { enableHighAccuracy:highAcc, maximumAge:30000, timeout:15000 }
+    );
+  };
+  tryWatch(true);
 }
 function stopGps(){ if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
 
@@ -699,7 +730,7 @@ async function startMonitor(){
   startPending=true;
   acquireWakeLock(); startGps(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0; calArr=[]; postSessionCooldownTs=0;
-  var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 20 : 10;  // 凌晨 1-6 点 20s，其他 10s
+  var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 10 : 2;  // 凌晨 1-6 点 10s 校准，白天快速 2s
   try{
     await ensureStream();
     if(stopPending){ stopPending=false; startPending=false; toast("已取消启动"); return; }
