@@ -312,6 +312,7 @@ const LEAD_MAX_MS = 2000;      // 触发前最多向前 2 秒
 const LEAD_DB_OFFSET = 3;      // 触发前该段 dB 高于背景底噪这个量才算“不同于背景”，才纳入
 const SAMPLE_GAIN = 3;          // 样本录音放大增益（原始响度偏低，放大后直接播放可听）
 function ringStart(){
+  if(!window.MediaRecorder) return;   // iOS 12 Safari 无 MediaRecorder，跳过样本录音（仅监测 dB）
   if(!combinedStream) return;
   var at = combinedStream.getAudioTracks()[0];
   if(!at) return;
@@ -412,17 +413,22 @@ function processOverThreshold(currentDb){
     fallTs = null;
     if(noiseFloorSamples < noiseFloorCalSec*10) return;
     setThr();
-    // 触发：凌晨 = 原固定阈值(45dB) 或 噪声比背景高6dB（任一即触发）；
-    //      其他时段 = 仅固定阈值（白天>55 / 夜间>45），不再用背景+6
-    if(early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr)){
+    // 触发：勾选"背景声+X dB记录"→所有时段 噪声>背景声+XdB 或 超固定阈值，任一即触发；
+    //      未勾选→维持原逻辑（凌晨=45或背景+6；其他时段=固定阈值）
+    var gapOn = !!($("dbGapCb") && $("dbGapCb").checked);
+    var gapVal = gapOn ? (parseFloat($("dbGapIn").value)||6) : 0;
+    var pass = gapOn ? (currentDb > thr || currentDb > (noiseFloorDb + gapVal))
+                     : (early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr));
+    if(pass){
       overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
     }
   } else {
     var sessionDur = (nowTs - overSession.startTs)/1000;
     if(sessionDur >= MAX_SESSION_SEC){ closeAndSaveSession(); return; }
     if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
-    // 结束线：凌晨 = 背景+3（噪声真正回落到常态附近才停）；其他时段 = 固定阈值（降到阈值以下即结束）
-    var releaseLevel = early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS);   // 凌晨=背景+3；白天/夜间=阈值-5dB滞回
+    // 结束线：勾选背景+X时=背景+3；未勾选时 凌晨=背景+3 / 其他=固定阈值-5dB滞回
+    var releaseLevel = gapOn ? (noiseFloorDb + RELEASE_OFFSET)
+                             : (early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS));   // 勾选=背景+3；未勾选 凌晨=背景+3/其他=阈值-5dB
     if(currentDb > releaseLevel){ fallTs=null; }
     else {
       if(fallTs===null) fallTs=nowTs;
@@ -672,6 +678,7 @@ async function doFinalize(){
 }
 
 async function startRecording(){
+  if(!window.MediaRecorder){ toast("此设备浏览器不支持录像/样本录音（需 Safari iOS 14.5+），仅进行噪声监测"); return; }
   if(recording) return;
   try{
     if(!deviceId) deviceId = await getDeviceFingerprint();
@@ -807,8 +814,8 @@ function renderLog(){
       '<td>'+(r.durationSec||"N/A")+'s</td>'+
       '<td>'+r.peakDb+'</td>'+
       '<td class="au"><span class="muted">—</span></td>'+
-      '<td>'+(r.lat??"--")+'</td>'+
-      '<td>'+(r.lon??"--")+'</td>'+
+      '<td>'+(r.lat!=null?r.lat:"--")+'</td>'+
+      '<td>'+(r.lon!=null?r.lon:"--")+'</td>'+
       '<td><button type="button" class="au-btn del-btn">删除</button></td>';
     b.appendChild(tr);
     // 音频从 IndexedDB 异步取回，取到后填充播放控件
@@ -858,8 +865,8 @@ async function exportHtmlReport(){
   <td style="padding:6px 8px">${rec.durationSec||"N/A"} s</td>
   <td style="padding:6px 8px">${rec.peakDb} dB</td>
   <td style="padding:6px 8px">${audioHtml}</td>
-  <td style="padding:6px 8px">${rec.lat??"--"}</td>
-  <td style="padding:6px 8px">${rec.lon??"--"}</td>
+  <td style="padding:6px 8px">${rec.lat!=null?rec.lat:"--"}</td>
+  <td style="padding:6px 8px">${rec.lon!=null?rec.lon:"--"}</td>
 </tr>
 `;
   }
@@ -960,6 +967,13 @@ function applyMem(){
         else { _vt.checked = true; }   // 默认录视频
       }
     }
+    var _gc=$("dbGapCb"), _gi=$("dbGapIn");
+    if(_gc && _gi){
+      var _gv=localStorage.getItem("qs_gapcb_"+deviceId);
+      if(_gv!=null) _gc.checked = (_gv === "1");
+      var _gn=parseInt(localStorage.getItem("qs_gapval_"+deviceId),10);
+      if(!isNaN(_gn)) _gi.value=_gn;
+    }
     syncVideoArea();
   }catch(e){}
 }
@@ -973,6 +987,14 @@ function applyMem(){
     if(deviceId) try{ localStorage.setItem("qs_video_"+deviceId, _vt.checked ? "1":"0"); }catch(e){}
     syncVideoArea();
   });
+  var _gc2=$("dbGapCb"), _gi2=$("dbGapIn");
+  if(_gc2 && _gi2){
+    var saveGap=function(){
+      if(deviceId) try{ localStorage.setItem("qs_gapcb_"+deviceId, _gc2.checked?"1":"0"); localStorage.setItem("qs_gapval_"+deviceId, _gi2.value||"6"); }catch(e){}
+    };
+    _gc2.addEventListener("change", saveGap);
+    _gi2.addEventListener("input", saveGap);
+  }
   if(deviceId) applyMem();
   else getDeviceFingerprint().then(applyMem);
 })();
