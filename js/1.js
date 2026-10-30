@@ -106,7 +106,7 @@ var running=false;
 var noiseFloorDb = 30;
 var noiseFloorSamples = 0;
 var noiseFloorSum = 0;
-var NOISE_FLOOR_CAL_SEC = 2;
+var noiseFloorCalSec = 2;   // 背景噪声校准时长(秒)：凌晨 1-6 点延长到 10s 更稳
 var NOISE_FLOOR_ALPHA = 0.02;
 
 function initAudioAnalysis(stream){
@@ -153,9 +153,9 @@ function computeDb(){
   if(scopeEnv.length > ltFz) scopeEnv.splice(0, scopeEnv.length-ltFz);
 
   if(!overSession.active){
-    if(noiseFloorSamples < NOISE_FLOOR_CAL_SEC*10){
+    if(noiseFloorSamples < noiseFloorCalSec*10){
       noiseFloorSum += db; noiseFloorSamples++;
-      if(noiseFloorSamples === NOISE_FLOOR_CAL_SEC*10){
+      if(noiseFloorSamples === noiseFloorCalSec*10){
         noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, noiseFloorSum/noiseFloorSamples));
       }
     } else if(db < noiseFloorDb + 3){
@@ -381,7 +381,7 @@ function processOverThreshold(currentDb){
   var triggerLevel = noiseFloorDb + TRIG_OFFSET;
   if(!overSession.active){
     fallTs = null;
-    if(noiseFloorSamples < NOISE_FLOOR_CAL_SEC*10) return;
+    if(noiseFloorSamples < noiseFloorCalSec*10) return;
     setThr();
     var hh = new Date().getHours();
     // 凌晨 01:00~06:00 前：保留原逻辑（超固定阈值就记录），同时噪声比背景声高 6dB 也记录（两者任一满足即触发）
@@ -683,6 +683,7 @@ async function startMonitor(){
   startPending=true;
   acquireWakeLock(); startGps(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0;
+  var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 10 : 2;  // 凌晨 1-6 点用 10s 校准背景
   try{
     await ensureStream();
     if(stopPending){ stopPending=false; startPending=false; toast("已取消启动"); return; }
