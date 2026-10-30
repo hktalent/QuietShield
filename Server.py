@@ -11,7 +11,7 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 import html
 
-ADDR = ('0.0.0.0', 8088)
+ADDR = ('0.0.0.0', 8888)
 LOG_DIR = "logs"
 VIDEO_DIR = "videos"
 os.makedirs(LOG_DIR, exist_ok=True)

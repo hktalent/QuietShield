@@ -383,7 +383,10 @@ function processOverThreshold(currentDb){
     fallTs = null;
     if(noiseFloorSamples < NOISE_FLOOR_CAL_SEC*10) return;
     setThr();
-    if(currentDb > triggerLevel && currentDb > thr){
+    var hh = new Date().getHours();
+    // 凌晨 01:00~06:00 前：保留原逻辑（超固定阈值就记录），同时噪声比背景声高 6dB 也记录（两者任一满足即触发）
+    var early = (hh >= 1 && hh < 6);
+    if((early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > triggerLevel && currentDb > thr))){
       overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
     }
   } else {
