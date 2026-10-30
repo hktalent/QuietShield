@@ -69,6 +69,27 @@ QuietShield/
 | GET | `/api/videos` | 按设备/标签/会话返回录像清单（含 webm 分片与合并的 mp4） |
 | GET | `/videos/<deviceId>/<file>.webm` / `.mp4` | 播放分片或合并后的 MP4（正确 mime，支持中文名） |
 
+## 依赖与安装
+
+| 依赖 | 用途 | 说明 |
+|---|---|---|
+| Python 3（本项目用 `/Users/51pwn/anaconda3`） | 后端服务 `Server.py` | macOS 自带或 anaconda |
+| `user_agents`（Python 库） | 日志 User-Agent → 可读设备/系统（如「iPhone · iOS 12.0 · Mobile Safari」） | **必须安装**，缺失时日志 UA 列显示原始字符串 |
+| ffmpeg（`/Users/51pwn/anaconda3/bin/ffmpeg`） | 录像分片合并为 MP4、加水印 | `start.sh` 会探测并提示 |
+| OpenSSL | 生成自签证书（`start.sh` 首次） | macOS 自带 |
+
+安装步骤（缺什么装什么）：
+
+```bash
+# UA 解析库（后端日志用）
+/Users/51pwn/anaconda3/bin/pip install user_agents
+
+# ffmpeg（macOS 若无，可用 Homebrew）
+# brew install ffmpeg
+```
+
+> 说明：安装 `user_agents` 并重启服务后，日志的 UA 列才显示可读系统；此前旧日志仍为原始 UA。
+
 ## 运行
 
 ```bash

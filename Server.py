@@ -6,6 +6,7 @@ import os
 import re
 import glob
 import subprocess
+import user_agents  # 解析 User-Agent → 可读的设备/系统（如 iOS 12.0 iPhone）
 import threading
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
@@ -353,7 +354,21 @@ class MyHandler(SimpleHTTPRequestHandler):
         payload = json.loads(body.decode("utf-8"))
 
         remote_ip = html.escape(self.client_address[0])
-        ua = html.escape(self.headers.get("User-Agent", ""))
+        ua_raw = self.headers.get("User-Agent", "")
+        ua = html.escape(ua_raw)
+        # UA → 友好系统描述（如「iPhone · iOS 12.4 · Mobile Safari」）；原始 UA 悬停可看
+        ua_disp = ua
+        try:
+            _up = user_agents.parse(ua_raw)
+            _dev = _up.device.family or "未知设备"
+            _osn = (_up.os.family or "未知系统")
+            _osv = _up.os.version_string or ""
+            _br = _up.browser.family or ""
+            ua_disp = f"{_dev} · {_osn}{(' '+_osv) if _osv else ''}"
+            if _br: ua_disp += f" · {_br}"
+            ua_disp = html.escape(ua_disp)
+        except Exception:
+            ua_disp = ua
         device_id = html.escape(safe_token(payload.get("deviceId", ""), fallback="--"))
         tag = html.escape(safe_token(payload.get("tag", ""), fallback="--"))
 
@@ -387,7 +402,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             f"<td>{audio_html}</td>"
             f"<td>{tag}</td>"
             f"<td>{remote_ip}</td>"
-            f"<td>{ua}</td>"
+            f'<td title="{ua}">{ua_disp}</td>'
             f"</tr>\n"
         )
 
