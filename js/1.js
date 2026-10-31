@@ -968,7 +968,7 @@ async function exportHtmlReport(){
 <style>body{font-family:system-ui,monospace;padding:16px;background:#f8f8f8;color:#111;}
 h2{margin-bottom:12px;}table{border-collapse:collapse;width:100%;font-size:12px;}
 th{background:#222;color:#fff;padding:8px;text-align:left;}td{background:#fff;}img{max-width:100%;}
-tbody tr:nth-child(even){background:#fffacd;}tbody tr:hover{background:#ffe97a;}
+tbody tr:nth-child(even) td{background:#fffacd;}tbody tr:hover td{background:#ffe97a!important;}
 audio{vertical-align:middle;}button{padding:3px 6px;font-size:11px;cursor:pointer;}
 </style>
 <script>

@@ -166,8 +166,8 @@ h2{{margin-bottom:12px;}}
 table{{border-collapse:collapse;width:100%;font-size:12px;}}
 th{{background:#222;color:#fff;padding:8px;text-align:left;}}
 td{{background:#fff;padding:6px 8px;border-bottom:#ccc 1px solid;}}
-tbody tr:nth-child(even){{background:#fffacd;}}
-tbody tr:hover{{background:#ffe97a;}}
+tbody tr:nth-child(even) td{{background:#fffacd;}}
+tbody tr:hover td{{background:#ffe97a!important;}}
 audio{{vertical-align:middle;height:28px;max-width:240px;}}
 button{{padding:3px 6px;font-size:11px;cursor:pointer;}}
 </style>

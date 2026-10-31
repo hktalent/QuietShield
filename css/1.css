@@ -103,8 +103,8 @@ td.au .au-btn{margin-top:3px;padding:2px 6px;font-size:10px;border:1px solid var
 thead th{position:sticky;top:0;background:#0E161D;color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);font-size:10px}
 tbody tr{border-bottom:1px solid #17222B}
 tbody tr:last-child{border-bottom:none}
-tbody tr:nth-child(even){background:rgba(255,215,0,.14)}
-tbody tr:hover{background:rgba(255,215,0,.35)}
+tbody tr:nth-child(even) td{background:rgba(255,215,0,.14)}
+tbody tr:hover td{background:rgba(255,215,0,.35)!important}
 tbody tr.alarm td:first-child{color:var(--red);font-weight:700}
 tbody tr.alarm{background:rgba(239,68,68,.05)}
 .empty{color:var(--muted);text-align:center;padding:22px 10px;font-size:12px}
