@@ -868,26 +868,10 @@ async function stopMonitor(){
 /* ---------- 日志渲染 ---------- */
 /* ---------- 噪声样本播放（高通 + 温和噪声门 + 瞬态增强 + 高增益） ---------- */
 var _boostCtx=null;
-var _enhancerWorkletLoaded = false;   // 缓存 worklet 加载结果，避免重复加载
 
-/* 构建「纯内置节点」回退处理链（无 AudioWorklet 时使用）：
- * 高通 → 噪声门式压缩器 → 增益 → 限幅（不用低通/峰值，避免变闷/改音色） */
-function buildFallbackChain(ctx, src, boostGain){
-  var hp = ctx.createBiquadFilter();
-  hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
-  // 用压缩器模拟噪声门：低阈值+高比率，弱信号被大幅衰减但不完全静音
-  var gate = ctx.createDynamicsCompressor();
-  gate.threshold.value=-46; gate.knee.value=8; gate.ratio.value=8;
-  gate.attack.value=0.003; gate.release.value=0.12;
-  var g = ctx.createGain(); g.gain.value = boostGain;
-  var lim = ctx.createDynamicsCompressor();
-  lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20;
-  lim.attack.value=0.002; lim.release.value=0.15;
-  src.connect(hp); hp.connect(gate); gate.connect(g); g.connect(lim); lim.connect(ctx.destination);
-}
-
-async function playBoostAudio(dataUrl, boostGain){
-  boostGain = boostGain || 6.0;   // 高增益保证响度，噪声门负责压低背景
+// 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理
+async function playSimpleBoostAudio(dataUrl, boostGain){
+  boostGain = boostGain || 5.0;
   if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
   _boostCtx = new (window.AudioContext||window.webkitAudioContext)();
   if(_boostCtx.state==='suspended'){ await _boostCtx.resume(); }
@@ -896,48 +880,19 @@ async function playBoostAudio(dataUrl, boostGain){
     for(var i=0;i<bin.length;i++){ buf[i]=bin.charCodeAt(i); }
     var ab=await _boostCtx.decodeAudioData(buf.buffer);
     var src=_boostCtx.createBufferSource(); src.buffer=ab;
-
-    // —— 前级：仅高通，切除低频隆隆（不做低通/峰值，保留高频细节与原始音色） ——
-    var hp = _boostCtx.createBiquadFilter();
-    hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
-    src.connect(hp);
-
-    // —— 核心：自适应噪声门（衰减而非静音）+ 温和瞬态增强（AudioWorklet） ——
-    var useWorklet = false;
-    if(_boostCtx.audioWorklet && !_enhancerWorkletLoaded){
-      try{
-        await _boostCtx.audioWorklet.addModule('js/noise-enhancer.js');
-        _enhancerWorkletLoaded = true;
-      }catch(e){ console.warn("noise-enhancer worklet 加载失败，使用回退链", e); }
-    }
-    if(_boostCtx.audioWorklet && _enhancerWorkletLoaded){
-      try{
-        var enhancer = new AudioWorkletNode(_boostCtx, 'noise-enhancer');
-        enhancer.parameters.get('gateMargin').value = 6;       // 门限：底噪+6dB
-        enhancer.parameters.get('transientBoost').value = 1.5; // 瞬态+1.5倍（温和）
-        enhancer.parameters.get('gateFloor').value = 0.005;
-        enhancer.parameters.get('floorGain').value = 0.2;      // 低于门限保留20%，不完全静音
-        hp.connect(enhancer);
-        var g = _boostCtx.createGain(); g.gain.value = boostGain;
-        var lim = _boostCtx.createDynamicsCompressor();
-        lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20;
-        lim.attack.value=0.002; lim.release.value=0.15;
-        enhancer.connect(g); g.connect(lim); lim.connect(_boostCtx.destination);
-        useWorklet = true;
-      }catch(e){ console.warn("AudioWorkletNode 创建失败，使用回退链", e); }
-    }
-    if(!useWorklet){ buildFallbackChain(_boostCtx, src, boostGain); }
-
+    var g=_boostCtx.createGain(); g.gain.value=boostGain;
+    var lim=_boostCtx.createDynamicsCompressor();
+    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
+    src.connect(g); g.connect(lim); lim.connect(_boostCtx.destination);
     src.onended=function(){ if(_boostCtx){ _boostCtx.close(); _boostCtx=null; } };
     src.start(0);
   }catch(err){
-    console.warn("增强播放失败，改用原生播放", err);
-    try{ var _fa=new Audio(dataUrl); _fa.play(); }catch(e2){}
+    console.warn("简单增益播放失败", err);
     if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
   }
 }
 // 暴露为全局，供动态生成的日志行内联 onclick 调用（js/1.js 在 IIFE 内，默认不挂到 window）
-window.playBoostAudio = playBoostAudio;
+window.playSimpleBoostAudio = playSimpleBoostAudio;
 
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
@@ -963,7 +918,7 @@ function renderLog(){
       getMedia(ts).then(function(m){
         if(!cell || !m || !validAudio(m.audioData)) return;
         cell.innerHTML='<audio controls preload="none"><source src="'+m.audioData+'" type="audio/webm">不支持</audio>'+
-          '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强</button>';
+          '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playSimpleBoostAudio(s.src,5.0);">🔊 5倍音量</button>';
       }).catch(function(){});
     })(r.timeTs, tr.querySelector(".au"));
     // 删除本行：同步删前端(IndexedDB+列表)并通知后端删除对应日志
@@ -996,7 +951,7 @@ async function exportHtmlReport(){
     var media=mediaMap[rec.timeTs]||{};
     var audioData=validAudio(media.audioData) ? media.audioData : null;
     var audioHtml = audioData
-      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强播放</button>`
+      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playSimpleBoostAudio(s.src,5.0);">🔊 5倍音量</button>`
       : '<span style="color:#888">无录音片段</span>';
     var locTip = rec.address ? (rec.address+"（"+rec.lat+", "+rec.lon+"）") : ((rec.lat!=null?rec.lat:"--")+", "+(rec.lon!=null?rec.lon:"--"));
     rows += `<tr style="border-bottom:#ccc 1px solid;">
@@ -1013,13 +968,13 @@ async function exportHtmlReport(){
 <style>body{font-family:system-ui,monospace;padding:16px;background:#f8f8f8;color:#111;}
 h2{margin-bottom:12px;}table{border-collapse:collapse;width:100%;font-size:12px;}
 th{background:#222;color:#fff;padding:8px;text-align:left;}td{background:#fff;}img{max-width:100%;}
+tbody tr:nth-child(even){background:#fffacd;}tbody tr:hover{background:#ffe97a;}
 audio{vertical-align:middle;}button{padding:3px 6px;font-size:11px;cursor:pointer;}
 </style>
 <script>
 let playBoostAudioCtx=null;
-/* 独立 HTML 报告无 worklet 文件可用，采用纯内置节点链：
- * 高通→噪声门式压缩→增益→限幅（不用低通/峰值，避免变闷/改音色） */
-async function playBoostAudio(dataUrl, boostGain=6.0){
+/* 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理 */
+async function playSimpleBoostAudio(dataUrl, boostGain=5.0){
   if(playBoostAudioCtx){ try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx=null; }
   playBoostAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
   if(playBoostAudioCtx.state==='suspended'){ await playBoostAudioCtx.resume(); }
@@ -1028,17 +983,10 @@ async function playBoostAudio(dataUrl, boostGain=6.0){
     for(let i=0;i<bin.length;i++){ buf[i]=bin.charCodeAt(i); }
     const ab=await playBoostAudioCtx.decodeAudioData(buf.buffer);
     const src=playBoostAudioCtx.createBufferSource(); src.buffer=ab;
-    const hp=playBoostAudioCtx.createBiquadFilter();
-    hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
-    // 压缩器模拟噪声门：低阈值+高比率衰减弱信号（背景噪声），不完全静音
-    const gate=playBoostAudioCtx.createDynamicsCompressor();
-    gate.threshold.value=-46; gate.knee.value=8; gate.ratio.value=8;
-    gate.attack.value=0.003; gate.release.value=0.12;
     const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
     const lim=playBoostAudioCtx.createDynamicsCompressor();
-    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20;
-    lim.attack.value=0.002; lim.release.value=0.15;
-    src.connect(hp); hp.connect(gate); gate.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
+    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
+    src.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
     src.onended=()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } };
     src.start(0);
   }catch(err){ alert("音频播放失败："+err.message); if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } }

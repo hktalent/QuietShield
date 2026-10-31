@@ -166,24 +166,16 @@ h2{{margin-bottom:12px;}}
 table{{border-collapse:collapse;width:100%;font-size:12px;}}
 th{{background:#222;color:#fff;padding:8px;text-align:left;}}
 td{{background:#fff;padding:6px 8px;border-bottom:#ccc 1px solid;}}
+tbody tr:nth-child(even){{background:#fffacd;}}
+tbody tr:hover{{background:#ffe97a;}}
 audio{{vertical-align:middle;height:28px;max-width:240px;}}
 button{{padding:3px 6px;font-size:11px;cursor:pointer;}}
 </style>
 <script>
 let playBoostAudioCtx = null;
-let enhancerWorkletLoaded = false;
-/* 纯内置节点回退链：高通→噪声门式压缩→增益→限幅（不用低通/峰值，避免变闷/改音色） */
-function buildFallbackChain(ctx, src, boostGain){
-    const hp=ctx.createBiquadFilter(); hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
-    const gate=ctx.createDynamicsCompressor();
-    gate.threshold.value=-46; gate.knee.value=8; gate.ratio.value=8; gate.attack.value=0.003; gate.release.value=0.12;
-    const g=ctx.createGain(); g.gain.value=boostGain;
-    const lim=ctx.createDynamicsCompressor();
-    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
-    src.connect(hp); hp.connect(gate); gate.connect(g); g.connect(lim); lim.connect(ctx.destination);
-}
-async function playBoostAudio(dataUrl, boostGain=6.0){
-    if(playBoostAudioCtx){try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx = null; }
+/* 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理 */
+async function playSimpleBoostAudio(dataUrl, boostGain=5.0){
+    if(playBoostAudioCtx){ try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx = null; }
     playBoostAudioCtx = new (window.AudioContext||window.webkitAudioContext)();
     if(playBoostAudioCtx.state === 'suspended'){ await playBoostAudioCtx.resume(); }
     try{
@@ -195,31 +187,10 @@ async function playBoostAudio(dataUrl, boostGain=6.0){
         const audioBuf = await playBoostAudioCtx.decodeAudioData(buf.buffer);
         const srcNode = playBoostAudioCtx.createBufferSource();
         srcNode.buffer = audioBuf;
-        /* 前级：仅高通，切除低频隆隆（不做低通/峰值，保留高频细节与原始音色） */
-        const hp=playBoostAudioCtx.createBiquadFilter(); hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
-        srcNode.connect(hp);
-        /* 核心：自适应噪声门（衰减而非静音）+ 温和瞬态增强（AudioWorklet） */
-        let useWorklet = false;
-        if(playBoostAudioCtx.audioWorklet && !enhancerWorkletLoaded){
-            try{ await playBoostAudioCtx.audioWorklet.addModule('js/noise-enhancer.js'); enhancerWorkletLoaded=true; }
-            catch(e){ console.warn("noise-enhancer worklet 加载失败，使用回退链", e); }
-        }
-        if(playBoostAudioCtx.audioWorklet && enhancerWorkletLoaded){
-            try{
-                const enhancer = new AudioWorkletNode(playBoostAudioCtx, 'noise-enhancer');
-                enhancer.parameters.get('gateMargin').value = 6;
-                enhancer.parameters.get('transientBoost').value = 1.5;
-                enhancer.parameters.get('gateFloor').value = 0.005;
-                enhancer.parameters.get('floorGain').value = 0.2;
-                hp.connect(enhancer);
-                const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
-                const lim=playBoostAudioCtx.createDynamicsCompressor();
-                lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
-                enhancer.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
-                useWorklet=true;
-            }catch(e){ console.warn("AudioWorkletNode 创建失败，使用回退链", e); }
-        }
-        if(!useWorklet){ buildFallbackChain(playBoostAudioCtx, srcNode, boostGain); }
+        const g = playBoostAudioCtx.createGain(); g.gain.value = boostGain;
+        const lim = playBoostAudioCtx.createDynamicsCompressor();
+        lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
+        srcNode.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
         srcNode.onended = ()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx = null; } };
         srcNode.start(0);
     }catch(err){
@@ -260,12 +231,40 @@ class MyHandler(SimpleHTTPRequestHandler):
         self._set_cors()
         self.end_headers()
 
-    def _init_daily_html_log(self, log_file_path, loc_line="待首条记录写入后更新"):
+    # 位置占位符：地址未解析时写入此标记，解析成功后回填替换
+    LOC_PENDING = "定位中…"
+
+    def _init_daily_html_log(self, log_file_path, loc_line=None):
         if not os.path.exists(log_file_path):
             boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = HTML_HEADER.replace("{boot_time}", boot_time).replace("{loc_line}", html.escape(loc_line))
+            loc = loc_line if loc_line else self.LOC_PENDING
+            header = HTML_HEADER.replace("{boot_time}", boot_time).replace("{loc_line}", html.escape(loc))
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.write(header)
+
+    def _update_log_location(self, log_file_path, loc_line):
+        """回填日志抬头的位置行：把占位符/旧坐标替换为解析后的地址"""
+        if not os.path.exists(log_file_path) or not loc_line:
+            return
+        new_loc = html.escape(loc_line)
+        try:
+            with _io_lock:
+                with open(log_file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if self.LOC_PENDING in content:
+                    content = content.replace(self.LOC_PENDING, new_loc, 1)
+                else:
+                    # 已有旧地址/坐标，正则替换 locLine 段落内容
+                    content = re.sub(
+                        r'(<p id="locLine"[^>]*>📍 位置：).*?(</p>)',
+                        r"\g<1>" + new_loc + r"\g<2>",
+                        content,
+                        count=1,
+                    )
+                with open(log_file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+        except Exception as e:
+            print(f"[回填位置失败] {log_file_path}: {e}")
 
     # ---------- 视频分片实时落盘 ----------
     # 文件名规则：{标签}_{会话开始}_{本段开始}_{本段结束}_seg{序号}.webm  （时间均为 YYYYMMDD_HHMMSS）
@@ -497,7 +496,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             b64_escaped_html = audio_b64.replace("'", "&#39;")
             audio_html = (
                 f'<audio controls preload="none"><source src="{html.escape(audio_b64)}" type="{html.escape(mime)}">不支持播放'
-                f'</audio><br><button onclick="const s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强播放</button>'
+                f'</audio><br><button onclick="const s=this.parentElement.querySelector(\'source\');if(s)playSimpleBoostAudio(s.src,5.0);">🔊 5倍音量</button>'
             )
 
         timeText = html.escape(payload.get("timeText", ""))
@@ -514,10 +513,14 @@ class MyHandler(SimpleHTTPRequestHandler):
         loc_title = f"{lat}, {lon}"
         if address:
             loc_title = f"{address}（{lat}, {lon}）"
-        # 若日志文件刚创建，用首条记录的位置更新抬头位置行
-        loc_line = address or f"{lat}, {lon}"
-        if not os.path.exists(html_log_path):
+        # 抬头位置行：有地址写地址，无地址留占位符，后续拿到地址后回填
+        loc_line = address or None
+        file_existed = os.path.exists(html_log_path)
+        if not file_existed:
             self._init_daily_html_log(html_log_path, loc_line)
+        elif address:
+            # 文件已存在且本次解析到地址：回填抬头位置行（替换占位符/旧坐标）
+            self._update_log_location(html_log_path, address)
 
         timeTs_esc = html.escape(str(payload.get("timeTs", "")))
         tr_html = (
@@ -545,6 +548,8 @@ class MyHandler(SimpleHTTPRequestHandler):
             early_path = get_log_write_path(get_early_morning_log_filename())
             if not os.path.exists(early_path):
                 self._init_daily_html_log(early_path, loc_line)
+            elif address:
+                self._update_log_location(early_path, address)
             with _io_lock:
                 with open(early_path, "a", encoding="utf-8") as f:
                     f.write(tr_html)

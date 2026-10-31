@@ -6,6 +6,7 @@
 *.br
 *.dll
 db
+__pycache__
 server.crt
 server.key
 MyGp
