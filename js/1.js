@@ -440,7 +440,7 @@ function processOverThreshold(currentDb){
 }
 
 function liveDb(){
-  if((!running && !recording) || !soundLive) return;
+  if(!soundLive) return;
   computeDb();
   var db=DB.value;
   var dbTxt=db.toFixed(0);
@@ -448,13 +448,24 @@ function liveDb(){
   gGauge.f=S.sound; gGauge.c=(db>thr ? "#F5A623" : "#22D3EE"); gGauge.t=dbTxt;
   drawArc($("gSound"), gGauge.f, gGauge.c, gGauge.t);
   var st=$("sSound");
-  if(db>thr){ st.textContent="超阈值!"; st.className="gstate alarm"; }
-  else if(db>thr-10){ st.textContent="接近阈值"; st.className="gstate warn"; }
-  else { st.textContent="正常"; st.className="gstate"; }
+  if(st){
+    if(!running && !recording){ st.textContent="待机"; st.className="gstate"; }
+    else if(db>thr){ st.textContent="超阈值!"; st.className="gstate alarm"; }
+    else if(db>thr-10){ st.textContent="接近阈值"; st.className="gstate warn"; }
+    else { st.textContent="正常"; st.className="gstate"; }
+  }
   drawScope();
-  processOverThreshold(db);
+  if(running) processOverThreshold(db);   // 仅在监测中做阈值检测与日志记录
 }
-function liveLoop(){ if(running||recording){ liveDb(); setTimeout(liveLoop,100); } }
+var _liveLoopRunning=false;
+function liveLoop(){
+  if(_liveLoopRunning) return;
+  _liveLoopRunning=true;
+  (function tick(){
+    if(soundLive){ liveDb(); setTimeout(tick,100); }
+    else { _liveLoopRunning=false; }
+  })();
+}
 
 /* ---------- 绘制 ---------- */
 var gGauge={f:0,c:"#22D3EE",t:"--"}; // 声压计当前绘制状态，用于窗口缩放时重绘（含空闲态）
@@ -570,6 +581,38 @@ function startGps(){
   tryWatch(true);
 }
 function stopGps(){ if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
+
+/* ---------- GPS 显示：把经纬度渲染到「实时声波」标题栏中间 ---------- */
+function updateGpsDisplay(){
+  var el=$("gpsDisp");
+  if(!el) return;
+  if(gpsLat!==null && gpsLon!==null){
+    el.textContent="📍 "+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5);
+    el.style.color="var(--cyan)";
+  } else {
+    el.textContent="📍 定位中…";
+    el.style.color="";
+  }
+}
+
+/* —— 常驻初始化：首次用户交互即启动麦克风（dB 动态显示）与 GPS —— */
+var alwaysOnInited=false;
+function initAlwaysOn(){
+  if(alwaysOnInited) return;
+  alwaysOnInited=true;
+  // 启动 GPS（页面加载即可定位，不依赖监测按钮）
+  startGps();
+  setInterval(updateGpsDisplay, 1000);
+  updateGpsDisplay();
+  // 请求麦克风权限并初始化音频分析（需用户手势，点击页面任意位置触发）
+  ensureStream().then(function(){
+    if(audioCtx && audioCtx.state==='suspended') audioCtx.resume();
+    liveLoop();   // 启动持续 dB 显示循环
+  }).catch(function(err){
+    console.warn("常驻音频初始化失败", err);
+    alwaysOnInited=false;   // 允许下次交互重试
+  });
+}
 
 /* ---------- 屏幕常亮 ---------- */
 var wakeLockTimer=null;
@@ -735,7 +778,8 @@ var startPending=false, stopPending=false;
 async function startMonitor(){
   if(running || startPending) return;
   startPending=true;
-  acquireWakeLock(); startGps(); resetOverSession();
+  initAlwaysOn();   // 确保麦克风与GPS已常驻运行（首次点击也能触发）
+  acquireWakeLock(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0; calArr=[]; postSessionCooldownTs=0;
   var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 10 : 2;  // 凌晨 1-6 点 10s 校准，白天快速 2s
   try{
@@ -755,16 +799,15 @@ async function startMonitor(){
 async function stopMonitor(){
   if(startPending){ stopPending=true; return; }   // 启动中：标记取消，等启动流程自行退出
   running=false;
-  stopGps();
   $("btnStart").textContent="开始监测";
   $("btnStart").className="btn primary";
   if(recording) await stopRecording();            // 录像随监测一并停止
   else if(videoRecorder && videoRecorder.state==="recording") videoRecorder.stop();
-  if(audioCtx) audioCtx.suspend();
   await closeAndSaveSession();
   stopRingRecording();                             // 停止滑块缓存录音
   releaseWakeLock();                                // 释放屏幕常亮，监测停止后可正常休眠
-  releaseStream();                                 // 释放摄像头/麦克风，preview 停止出画面
+  // 注意：不调用 releaseStream() / stopGps()，保持麦克风与GPS持续运行，
+  // 以便 dB 数值与经纬度在停止监测后仍持续动态显示
 }
 
 /* ---------- 日志渲染 ---------- */
@@ -1054,8 +1097,20 @@ drawArc($("gSound"),0,"#22D3EE","--"); gGauge.f=0; gGauge.c="#22D3EE"; gGauge.t=
 drawScope();
 window.addEventListener("resize", function(){
   drawArc($("gSound"), gGauge.f, gGauge.c, gGauge.t); // 始终随窗口缩放重绘，保证 gSound 撑满并等比例放大
-  if(running||recording) computeDb();
+  if(soundLive) computeDb();
   drawScope();
 });
+
+// —— 首次用户交互即启动常驻音频（dB 动态显示）与 GPS ——
+// 浏览器要求 getUserMedia 必须由用户手势触发，故监听首次点击/触摸
+function _onFirstInteraction(){
+  initAlwaysOn();
+  document.removeEventListener("click", _onFirstInteraction);
+  document.removeEventListener("touchstart", _onFirstInteraction);
+  document.removeEventListener("keydown", _onFirstInteraction);
+}
+document.addEventListener("click", _onFirstInteraction);
+document.addEventListener("touchstart", _onFirstInteraction);
+document.addEventListener("keydown", _onFirstInteraction);
 
 })();

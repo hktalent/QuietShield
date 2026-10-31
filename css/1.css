@@ -62,7 +62,8 @@ header{padding:14px 0 10px;display:flex;align-items:center;justify-content:space
 .wave{margin-top:6px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px}
 .wave .w-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}
 .wave .w-h .nm{font-size:11px;color:var(--muted);font-weight:600}
-.wave .w-h .live-db{font-family:var(--mono);font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}
+.wave .w-h .gps{font-family:var(--mono);font-size:10px;color:var(--muted);flex:1;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wave .w-h .live-db{font-family:var(--mono);font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;flex-shrink:0}
 /* 提升波形画布高度到80px */
 canvas#scope{display:block;width:100%;height:80px;background:#080C10;border-radius:8px;border:1px solid var(--line)}
 /* ===== 日志区 ===== */
