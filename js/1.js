@@ -768,10 +768,28 @@ async function stopMonitor(){
 }
 
 /* ---------- 日志渲染 ---------- */
-/* ---------- 噪声样本播放（含 ×5 放大） ---------- */
+/* ---------- 噪声样本播放（高通 + 温和噪声门 + 瞬态增强 + 高增益） ---------- */
 var _boostCtx=null;
+var _enhancerWorkletLoaded = false;   // 缓存 worklet 加载结果，避免重复加载
+
+/* 构建「纯内置节点」回退处理链（无 AudioWorklet 时使用）：
+ * 高通 → 噪声门式压缩器 → 增益 → 限幅（不用低通/峰值，避免变闷/改音色） */
+function buildFallbackChain(ctx, src, boostGain){
+  var hp = ctx.createBiquadFilter();
+  hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
+  // 用压缩器模拟噪声门：低阈值+高比率，弱信号被大幅衰减但不完全静音
+  var gate = ctx.createDynamicsCompressor();
+  gate.threshold.value=-46; gate.knee.value=8; gate.ratio.value=8;
+  gate.attack.value=0.003; gate.release.value=0.12;
+  var g = ctx.createGain(); g.gain.value = boostGain;
+  var lim = ctx.createDynamicsCompressor();
+  lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20;
+  lim.attack.value=0.002; lim.release.value=0.15;
+  src.connect(hp); hp.connect(gate); gate.connect(g); g.connect(lim); lim.connect(ctx.destination);
+}
+
 async function playBoostAudio(dataUrl, boostGain){
-  boostGain = boostGain || 5.0;
+  boostGain = boostGain || 6.0;   // 高增益保证响度，噪声门负责压低背景
   if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
   _boostCtx = new (window.AudioContext||window.webkitAudioContext)();
   if(_boostCtx.state==='suspended'){ await _boostCtx.resume(); }
@@ -780,19 +798,42 @@ async function playBoostAudio(dataUrl, boostGain){
     for(var i=0;i<bin.length;i++){ buf[i]=bin.charCodeAt(i); }
     var ab=await _boostCtx.decodeAudioData(buf.buffer);
     var src=_boostCtx.createBufferSource(); src.buffer=ab;
-    var g=_boostCtx.createGain(); g.gain.value=boostGain;
-    var comp=_boostCtx.createDynamicsCompressor();
-    // limiter：只在接近 -6dBFS 防削波，不再抬低响度背景（避免×5播放时背景嗡嗡更响）
-    comp.threshold.value=-6; comp.knee.value=2; comp.ratio.value=20;
-    comp.attack.value=0.002; comp.release.value=0.2;
-    // 高通：滤掉低频"嗡嗡"背景（对旧样本同样有效）
-    var hp=_boostCtx.createBiquadFilter();
-    hp.type="highpass"; hp.frequency.value=150; hp.Q.value=0.7;
-    src.connect(g); g.connect(hp); hp.connect(comp); comp.connect(_boostCtx.destination);
+
+    // —— 前级：仅高通，切除低频隆隆（不做低通/峰值，保留高频细节与原始音色） ——
+    var hp = _boostCtx.createBiquadFilter();
+    hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
+    src.connect(hp);
+
+    // —— 核心：自适应噪声门（衰减而非静音）+ 温和瞬态增强（AudioWorklet） ——
+    var useWorklet = false;
+    if(_boostCtx.audioWorklet && !_enhancerWorkletLoaded){
+      try{
+        await _boostCtx.audioWorklet.addModule('js/noise-enhancer.js');
+        _enhancerWorkletLoaded = true;
+      }catch(e){ console.warn("noise-enhancer worklet 加载失败，使用回退链", e); }
+    }
+    if(_boostCtx.audioWorklet && _enhancerWorkletLoaded){
+      try{
+        var enhancer = new AudioWorkletNode(_boostCtx, 'noise-enhancer');
+        enhancer.parameters.get('gateMargin').value = 6;       // 门限：底噪+6dB
+        enhancer.parameters.get('transientBoost').value = 1.5; // 瞬态+1.5倍（温和）
+        enhancer.parameters.get('gateFloor').value = 0.005;
+        enhancer.parameters.get('floorGain').value = 0.2;      // 低于门限保留20%，不完全静音
+        hp.connect(enhancer);
+        var g = _boostCtx.createGain(); g.gain.value = boostGain;
+        var lim = _boostCtx.createDynamicsCompressor();
+        lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20;
+        lim.attack.value=0.002; lim.release.value=0.15;
+        enhancer.connect(g); g.connect(lim); lim.connect(_boostCtx.destination);
+        useWorklet = true;
+      }catch(e){ console.warn("AudioWorkletNode 创建失败，使用回退链", e); }
+    }
+    if(!useWorklet){ buildFallbackChain(_boostCtx, src, boostGain); }
+
     src.onended=function(){ if(_boostCtx){ _boostCtx.close(); _boostCtx=null; } };
     src.start(0);
   }catch(err){
-    console.warn("放大播放失败，改用原生播放", err);
+    console.warn("增强播放失败，改用原生播放", err);
     try{ var _fa=new Audio(dataUrl); _fa.play(); }catch(e2){}
     if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
   }
@@ -824,7 +865,7 @@ function renderLog(){
       getMedia(ts).then(function(m){
         if(!cell || !m || !validAudio(m.audioData)) return;
         cell.innerHTML='<audio controls preload="none"><source src="'+m.audioData+'" type="audio/webm">不支持</audio>'+
-          '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,5.0);">🔊×5</button>';
+          '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强</button>';
       }).catch(function(){});
     })(r.timeTs, tr.querySelector(".au"));
     // 删除本行：同步删前端(IndexedDB+列表)并通知后端删除对应日志
@@ -857,7 +898,7 @@ async function exportHtmlReport(){
     var media=mediaMap[rec.timeTs]||{};
     var audioData=validAudio(media.audioData) ? media.audioData : null;
     var audioHtml = audioData
-      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,5.0);">🔊×5放大播放</button>`
+      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强播放</button>`
       : '<span style="color:#888">无录音片段</span>';
     rows += `<tr style="border-bottom:#ccc 1px solid;">
   <td style="padding:6px 8px">${rec.timeText}</td>
@@ -879,7 +920,9 @@ audio{vertical-align:middle;}button{padding:3px 6px;font-size:11px;cursor:pointe
 </style>
 <script>
 let playBoostAudioCtx=null;
-async function playBoostAudio(dataUrl, boostGain=5.0){
+/* 独立 HTML 报告无 worklet 文件可用，采用纯内置节点链：
+ * 高通→噪声门式压缩→增益→限幅（不用低通/峰值，避免变闷/改音色） */
+async function playBoostAudio(dataUrl, boostGain=6.0){
   if(playBoostAudioCtx){ try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx=null; }
   playBoostAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
   if(playBoostAudioCtx.state==='suspended'){ await playBoostAudioCtx.resume(); }
@@ -888,15 +931,17 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
     for(let i=0;i<bin.length;i++){ buf[i]=bin.charCodeAt(i); }
     const ab=await playBoostAudioCtx.decodeAudioData(buf.buffer);
     const src=playBoostAudioCtx.createBufferSource(); src.buffer=ab;
-    const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
-    const comp=playBoostAudioCtx.createDynamicsCompressor();
-    // limiter：只在接近 -6dBFS 防削波，不再抬低响度背景（避免×5播放时背景嗡嗡更响）
-    comp.threshold.value=-6; comp.knee.value=2; comp.ratio.value=20;
-    comp.attack.value=0.002; comp.release.value=0.2;
-    // 高通：滤掉低频"嗡嗡"背景（对旧样本同样有效）
     const hp=playBoostAudioCtx.createBiquadFilter();
-    hp.type="highpass"; hp.frequency.value=150; hp.Q.value=0.7;
-    src.connect(g); g.connect(hp); hp.connect(comp); comp.connect(playBoostAudioCtx.destination);
+    hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
+    // 压缩器模拟噪声门：低阈值+高比率衰减弱信号（背景噪声），不完全静音
+    const gate=playBoostAudioCtx.createDynamicsCompressor();
+    gate.threshold.value=-46; gate.knee.value=8; gate.ratio.value=8;
+    gate.attack.value=0.003; gate.release.value=0.12;
+    const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
+    const lim=playBoostAudioCtx.createDynamicsCompressor();
+    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20;
+    lim.attack.value=0.002; lim.release.value=0.15;
+    src.connect(hp); hp.connect(gate); gate.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
     src.onended=()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } };
     src.start(0);
   }catch(err){ alert("音频播放失败："+err.message); if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } }

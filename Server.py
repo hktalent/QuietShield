@@ -90,7 +90,18 @@ button{{padding:3px 6px;font-size:11px;cursor:pointer;}}
 </style>
 <script>
 let playBoostAudioCtx = null;
-async function playBoostAudio(dataUrl, boostGain=5.0){
+let enhancerWorkletLoaded = false;
+/* 纯内置节点回退链：高通→噪声门式压缩→增益→限幅（不用低通/峰值，避免变闷/改音色） */
+function buildFallbackChain(ctx, src, boostGain){
+    const hp=ctx.createBiquadFilter(); hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
+    const gate=ctx.createDynamicsCompressor();
+    gate.threshold.value=-46; gate.knee.value=8; gate.ratio.value=8; gate.attack.value=0.003; gate.release.value=0.12;
+    const g=ctx.createGain(); g.gain.value=boostGain;
+    const lim=ctx.createDynamicsCompressor();
+    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
+    src.connect(hp); hp.connect(gate); gate.connect(g); g.connect(lim); lim.connect(ctx.destination);
+}
+async function playBoostAudio(dataUrl, boostGain=6.0){
     if(playBoostAudioCtx){try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx = null; }
     playBoostAudioCtx = new (window.AudioContext||window.webkitAudioContext)();
     if(playBoostAudioCtx.state === 'suspended'){ await playBoostAudioCtx.resume(); }
@@ -103,17 +114,31 @@ async function playBoostAudio(dataUrl, boostGain=5.0){
         const audioBuf = await playBoostAudioCtx.decodeAudioData(buf.buffer);
         const srcNode = playBoostAudioCtx.createBufferSource();
         srcNode.buffer = audioBuf;
-        const gainNode = playBoostAudioCtx.createGain();
-        gainNode.gain.value = boostGain;
-        const compressor = playBoostAudioCtx.createDynamicsCompressor();
-        compressor.threshold.value = -18;
-        compressor.knee.value = 10;
-        compressor.ratio.value = 4;
-        compressor.attack.value = 0.003;
-        compressor.release.value = 0.25;
-        srcNode.connect(gainNode);
-        gainNode.connect(compressor);
-        compressor.connect(playBoostAudioCtx.destination);
+        /* 前级：仅高通，切除低频隆隆（不做低通/峰值，保留高频细节与原始音色） */
+        const hp=playBoostAudioCtx.createBiquadFilter(); hp.type="highpass"; hp.frequency.value=120; hp.Q.value=0.7;
+        srcNode.connect(hp);
+        /* 核心：自适应噪声门（衰减而非静音）+ 温和瞬态增强（AudioWorklet） */
+        let useWorklet = false;
+        if(playBoostAudioCtx.audioWorklet && !enhancerWorkletLoaded){
+            try{ await playBoostAudioCtx.audioWorklet.addModule('js/noise-enhancer.js'); enhancerWorkletLoaded=true; }
+            catch(e){ console.warn("noise-enhancer worklet 加载失败，使用回退链", e); }
+        }
+        if(playBoostAudioCtx.audioWorklet && enhancerWorkletLoaded){
+            try{
+                const enhancer = new AudioWorkletNode(playBoostAudioCtx, 'noise-enhancer');
+                enhancer.parameters.get('gateMargin').value = 6;
+                enhancer.parameters.get('transientBoost').value = 1.5;
+                enhancer.parameters.get('gateFloor').value = 0.005;
+                enhancer.parameters.get('floorGain').value = 0.2;
+                hp.connect(enhancer);
+                const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
+                const lim=playBoostAudioCtx.createDynamicsCompressor();
+                lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
+                enhancer.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
+                useWorklet=true;
+            }catch(e){ console.warn("AudioWorkletNode 创建失败，使用回退链", e); }
+        }
+        if(!useWorklet){ buildFallbackChain(playBoostAudioCtx, srcNode, boostGain); }
         srcNode.onended = ()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx = null; } };
         srcNode.start(0);
     }catch(err){
@@ -380,7 +405,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             b64_escaped_html = audio_b64.replace("'", "&#39;")
             audio_html = (
                 f'<audio controls preload="none"><source src="{html.escape(audio_b64)}" type="{html.escape(mime)}">不支持播放'
-                f'</audio><br><button onclick="const s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,5.0);">🔊×5放大播放</button>'
+                f'</audio><br><button onclick="const s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强播放</button>'
             )
 
         timeText = html.escape(payload.get("timeText", ""))
