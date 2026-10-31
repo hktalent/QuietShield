@@ -860,33 +860,9 @@ async function stopMonitor(){
 }
 
 /* ---------- 日志渲染 ---------- */
-/* ---------- 噪声样本播放（高通 + 温和噪声门 + 瞬态增强 + 高增益） ---------- */
-var _boostCtx=null;
-
-// 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理
-async function playSimpleBoostAudio(dataUrl, boostGain){
-  boostGain = boostGain || 5.0;
-  if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
-  _boostCtx = new (window.AudioContext||window.webkitAudioContext)();
-  if(_boostCtx.state==='suspended'){ await _boostCtx.resume(); }
-  try{
-    var b64=dataUrl.split(",")[1], bin=atob(b64), buf=new Uint8Array(bin.length);
-    for(var i=0;i<bin.length;i++){ buf[i]=bin.charCodeAt(i); }
-    var ab=await _boostCtx.decodeAudioData(buf.buffer);
-    var src=_boostCtx.createBufferSource(); src.buffer=ab;
-    var g=_boostCtx.createGain(); g.gain.value=boostGain;
-    var lim=_boostCtx.createDynamicsCompressor();
-    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
-    src.connect(g); g.connect(lim); lim.connect(_boostCtx.destination);
-    src.onended=function(){ if(_boostCtx){ _boostCtx.close(); _boostCtx=null; } };
-    src.start(0);
-  }catch(err){
-    console.warn("简单增益播放失败", err);
-    if(_boostCtx){ try{ _boostCtx.close(); }catch(e){} _boostCtx=null; }
-  }
-}
-// 暴露为全局，供动态生成的日志行内联 onclick 调用（js/1.js 在 IIFE 内，默认不挂到 window）
-window.playSimpleBoostAudio = playSimpleBoostAudio;
+/* 播放函数 playClearAudio（降噪清晰播放）/ playBoostAudio（5倍音量播放）已抽到
+ * js/player.js（顶层全局函数，index.html 先于本文件加载）。本文件的行内 onclick
+ * 直接调用全局函数；exportHtmlReport 用 playClearAudio.toString() 自包含嵌入导出报告。 */
 
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
@@ -912,7 +888,8 @@ function renderLog(){
       getMedia(ts).then(function(m){
         if(!cell || !m || !validAudio(m.audioData)) return;
         cell.innerHTML='<audio controls preload="none"><source src="'+m.audioData+'" type="audio/webm">不支持</audio>'+
-          '<br><button type="button" class="au-btn" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playSimpleBoostAudio(s.src,5.0);">🔊 5倍音量</button>';
+          '<br><button type="button" class="au-btn au-ico" title="5倍音量播放" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src);">🔊</button>'+
+          '<button type="button" class="au-btn au-ico" title="降噪清晰播放" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playClearAudio(s.src);">✨</button>';
       }).catch(function(){});
     })(r.timeTs, tr.querySelector(".au"));
     // 删除本行：同步删前端(IndexedDB+列表)并通知后端删除对应日志
@@ -945,7 +922,7 @@ async function exportHtmlReport(){
     var media=mediaMap[rec.timeTs]||{};
     var audioData=validAudio(media.audioData) ? media.audioData : null;
     var audioHtml = audioData
-      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playSimpleBoostAudio(s.src,5.0);">🔊 5倍音量</button>`
+      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button class="au-ico" title="5倍音量播放" onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src);">🔊</button><button class="au-ico" title="降噪清晰播放" onclick="const s=this.parentElement.querySelector('source');if(s)playClearAudio(s.src);">✨</button>`
       : '<span style="color:#888">无录音片段</span>';
     var locTip = rec.address ? (rec.address+"（"+rec.lat+", "+rec.lon+"）") : ((rec.lat!=null?rec.lat:"--")+", "+(rec.lon!=null?rec.lon:"--"));
     rows += `<tr style="border-bottom:#ccc 1px solid;">
@@ -964,27 +941,11 @@ h2{margin-bottom:12px;}table{border-collapse:collapse;width:100%;font-size:12px;
 th{background:#222;color:#fff;padding:8px;text-align:left;}td{background:#fff;}img{max-width:100%;}
 tbody tr:nth-child(even) td{background:#fffacd;}tbody tr:hover td{background:#ffe97a!important;}
 audio{vertical-align:middle;}button{padding:3px 6px;font-size:11px;cursor:pointer;}
+.au-ico{padding:1px 5px;font-size:13px;line-height:1.4;margin-right:3px;}
 </style>
 <script>
-let playBoostAudioCtx=null;
-/* 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理 */
-async function playSimpleBoostAudio(dataUrl, boostGain=5.0){
-  if(playBoostAudioCtx){ try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx=null; }
-  playBoostAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
-  if(playBoostAudioCtx.state==='suspended'){ await playBoostAudioCtx.resume(); }
-  try{
-    const b64=dataUrl.split(",")[1]; const bin=atob(b64); const buf=new Uint8Array(bin.length);
-    for(let i=0;i<bin.length;i++){ buf[i]=bin.charCodeAt(i); }
-    const ab=await playBoostAudioCtx.decodeAudioData(buf.buffer);
-    const src=playBoostAudioCtx.createBufferSource(); src.buffer=ab;
-    const g=playBoostAudioCtx.createGain(); g.gain.value=boostGain;
-    const lim=playBoostAudioCtx.createDynamicsCompressor();
-    lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
-    src.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
-    src.onended=()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } };
-    src.start(0);
-  }catch(err){ alert("音频播放失败："+err.message); if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; } }
-}
+var playClearAudio = ${playClearAudio.toString()};
+var playBoostAudio = ${playBoostAudio.toString()};
 </script>
 </head><body><h2>${reportTitle}</h2>
 <p>当前阈值：&gt;${thr} dB；最小记录时长：${MIN_RECORD_SEC}s；录像分片见后台 /review.html</p>

@@ -161,34 +161,7 @@ HTML_HEADER = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>噪声监测服务端日志 {boot_time}</title>
 <link href=../css/1.css rel=stylesheet>
-<script>
-let playBoostAudioCtx = null;
-/* 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理 */
-async function playSimpleBoostAudio(dataUrl, boostGain=5.0){
-    if(playBoostAudioCtx){ try{ playBoostAudioCtx.close(); }catch(e){} playBoostAudioCtx = null; }
-    playBoostAudioCtx = new (window.AudioContext||window.webkitAudioContext)();
-    if(playBoostAudioCtx.state === 'suspended'){ await playBoostAudioCtx.resume(); }
-    try{
-        const base64Str = dataUrl.split(",")[1];
-        const binaryStr = atob(base64Str);
-        const len = binaryStr.length;
-        const buf = new Uint8Array(len);
-        for(let i=0;i<len;i++){ buf[i] = binaryStr.charCodeAt(i); }
-        const audioBuf = await playBoostAudioCtx.decodeAudioData(buf.buffer);
-        const srcNode = playBoostAudioCtx.createBufferSource();
-        srcNode.buffer = audioBuf;
-        const g = playBoostAudioCtx.createGain(); g.gain.value = boostGain;
-        const lim = playBoostAudioCtx.createDynamicsCompressor();
-        lim.threshold.value=-6; lim.knee.value=2; lim.ratio.value=20; lim.attack.value=0.002; lim.release.value=0.15;
-        srcNode.connect(g); g.connect(lim); lim.connect(playBoostAudioCtx.destination);
-        srcNode.onended = ()=>{ if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx = null; } };
-        srcNode.start(0);
-    }catch(err){
-        alert("音频播放失败："+err.message);
-        if(playBoostAudioCtx){ playBoostAudioCtx.close(); playBoostAudioCtx=null; }
-    }
-}
-</script>
+<script src="../js/player.js"></script>
 </head>
 <body>
 <h2>噪声监测日志</h2>
@@ -208,6 +181,14 @@ async function playSimpleBoostAudio(dataUrl, boostGain=5.0){
 </thead>
 <tbody>
 """
+
+# 录音单元格的双图标播放按钮（🔊=5倍音量 ✨=降噪清晰）；行HTML与旧文件修补共用
+LOG_PLAYER_BTNS = (
+    '<button class="au-btn au-ico" title="5倍音量播放" '
+    "onclick=\"const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src);\">🔊</button>"
+    '<button class="au-btn au-ico" title="降噪清晰播放" '
+    "onclick=\"const s=this.parentElement.querySelector('source');if(s)playClearAudio(s.src);\">✨</button>"
+)
 
 
 class MyHandler(SimpleHTTPRequestHandler):
@@ -232,25 +213,47 @@ class MyHandler(SimpleHTTPRequestHandler):
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.write(header)
 
-    def _patch_log_css(self, log_file_path):
-        """修补已有日志文件的 CSS：补入隔行换色 + 悬停高亮样式"""
+    def _patch_log_file(self, log_file_path):
+        """修补已有日志文件（头部是创建时的快照，不随 Server.py 更新）：
+        ①补入隔行换色+悬停高亮 CSS；②播放器统一为外链 ../js/player.js（内嵌旧脚本或
+        缺脚本时按钮点击无反应）；③旧文字播放按钮统一升级为双图标按钮"""
         if not os.path.exists(log_file_path):
             return
         try:
             with _io_lock:
                 with open(log_file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                if "nth-child" in content:
-                    return  # 已有样式，无需修补
-                zebra_css = (
-                    "tbody tr:nth-child(even) td{background:#fffacd;}"
-                    "tbody tr:hover td{background:#ffe97a!important;}"
-                )
-                content = content.replace("</style>", zebra_css + "</style>", 1)
-                with open(log_file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                changed = False
+                # ① CSS
+                if "nth-child" not in content:
+                    zebra_css = (
+                        "tbody tr:nth-child(even) td{background:#fffacd;}"
+                        "tbody tr:hover td{background:#ffe97a!important;}"
+                    )
+                    content = content.replace("</style>", zebra_css + "</style>", 1)
+                    changed = True
+                # ② 播放器：统一为外链 ../js/player.js（旧文件可能内嵌了过时的播放器脚本，
+                #    或根本没有脚本 —— 按钮点击会无反应）
+                if "js/player.js" not in content:
+                    tag = '<script src="../js/player.js"></script>'
+                    if "<script>" in content:
+                        content = re.sub(r"<script>.*?</script>",
+                                         lambda _: tag, content, count=1, flags=re.DOTALL)
+                    else:
+                        content = content.replace("</head>", tag + "\n</head>", 1)
+                    changed = True
+                # ③ 旧按钮（带中文文字）→ 当前双图标按钮；新图标按钮内容无中文，不受影响
+                new_content = re.sub(
+                    r'(?:<button[^>]*>[^<]*[一-鿿][^<]*</button>\s*){1,2}',
+                    lambda _: LOG_PLAYER_BTNS, content)
+                if new_content != content:
+                    content = new_content
+                    changed = True
+                if changed:
+                    with open(log_file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
         except Exception as e:
-            print(f"[修补日志CSS失败] {log_file_path}: {e}")
+            print(f"[修补日志文件失败] {log_file_path}: {e}")
 
     def _update_log_location(self, log_file_path, loc_line):
         """回填日志抬头的位置行：把占位符/旧坐标替换为解析后的地址"""
@@ -506,7 +509,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             b64_escaped_html = audio_b64.replace("'", "&#39;")
             audio_html = (
                 f'<audio controls preload="none"><source src="{html.escape(audio_b64)}" type="{html.escape(mime)}">不支持播放'
-                f'</audio><br><button onclick="const s=this.parentElement.querySelector(\'source\');if(s)playSimpleBoostAudio(s.src,5.0);">🔊 5倍音量</button>'
+                f'</audio><br>' + LOG_PLAYER_BTNS
             )
 
         timeText = html.escape(payload.get("timeText", ""))
@@ -529,8 +532,8 @@ class MyHandler(SimpleHTTPRequestHandler):
         if not file_existed:
             self._init_daily_html_log(html_log_path, loc_line)
         else:
-            # 文件已存在：修补旧文件的 CSS（隔行换色 + 悬停高亮）
-            self._patch_log_css(html_log_path)
+            # 文件已存在：修补旧文件（CSS + 播放器脚本 + 旧按钮升级）
+            self._patch_log_file(html_log_path)
             if address:
                 # 回填抬头位置行（替换占位符/旧坐标）
                 self._update_log_location(html_log_path, address)
@@ -542,7 +545,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             f"<td>{tag}</td>"
             f"<td>{durSec}</td>"
             f"<td>{peakDb}</td>"
-            f"<td>{audio_html}</td>"
+            f'<td class="au">{audio_html}</td>'
             f"<td>{remote_ip}</td>"
             f'<td title="{ua}">{ua_disp}</td>'
             f"</tr>\n"
@@ -562,7 +565,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             if not os.path.exists(early_path):
                 self._init_daily_html_log(early_path, loc_line)
             else:
-                self._patch_log_css(early_path)
+                self._patch_log_file(early_path)
                 if address:
                     self._update_log_location(early_path, address)
             with _io_lock:
