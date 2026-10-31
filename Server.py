@@ -10,7 +10,14 @@ import user_agents  # 解析 User-Agent → 可读的设备/系统（如 iOS 12.
 import threading
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
+from urllib.request import urlopen, Request
 import html
+
+# 高德逆地理编码 API Key（从环境变量 QuietShield 读取，避免硬编码泄露）
+AMAP_KEY = os.environ.get("QuietShield", "").strip()
+# 服务端地址缓存：{ "lat,lon": {"address": ..., "ts": ...} }，减少重复 API 调用
+_regeo_cache = {}
+_REGO_CACHE_TTL = 7 * 24 * 3600  # 缓存 7 天
 
 ADDR = ('0.0.0.0', 8808)
 LOG_DIR = "logs"
@@ -28,6 +35,80 @@ DRAWTEXT_FONT = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf" if os.pat
 
 # 只允许安全字符，防路径穿越与文件名注入（\w 含中文与数字，故标签如"客厅"可保留）
 _SAFE_RE = re.compile(r"[^\w\-]")
+
+
+def _wgs84_to_gcj02(lng, lat):
+    """WGS-84 → GCJ-02（火星坐标系）。
+    浏览器 GPS 返回 WGS-84，高德使用 GCJ-02，不转换会偏移 100~700 米。
+    中国境外坐标不做偏移，直接返回原值。"""
+    import math
+    a = 6378245.0          # 长半轴
+    ee = 0.00669342162296594323  # 偏心率平方
+
+    def _out_of_china(lng, lat):
+        return not (73.66 < lng < 135.05 and 3.86 < lat < 53.55)
+
+    if _out_of_china(lng, lat):
+        return lng, lat
+
+    def _transform_lat(x, y):
+        ret = -100.0 + 2.0*x + 3.0*y + 0.2*y*y + 0.1*x*y + 0.2*math.sqrt(abs(x))
+        ret += (20.0*math.sin(6.0*x*math.pi) + 20.0*math.sin(2.0*x*math.pi)) * 2.0/3.0
+        ret += (20.0*math.sin(y*math.pi) + 40.0*math.sin(y/3.0*math.pi)) * 2.0/3.0
+        ret += (160.0*math.sin(y/12.0*math.pi) + 320*math.sin(y*math.pi/30.0)) * 2.0/3.0
+        return ret
+
+    def _transform_lng(x, y):
+        ret = 300.0 + x + 2.0*y + 0.1*x*x + 0.1*x*y + 0.1*math.sqrt(abs(x))
+        ret += (20.0*math.sin(6.0*x*math.pi) + 20.0*math.sin(2.0*x*math.pi)) * 2.0/3.0
+        ret += (20.0*math.sin(x*math.pi) + 40.0*math.sin(x/3.0*math.pi)) * 2.0/3.0
+        ret += (150.0*math.sin(x/12.0*math.pi) + 300.0*math.sin(x/30.0*math.pi)) * 2.0/3.0
+        return ret
+
+    dlat = _transform_lat(lng - 105.0, lat - 35.0)
+    dlng = _transform_lng(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * math.pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * math.pi)
+    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * math.pi)
+    return lng + dlng, lat + dlat
+
+
+def reverse_geocode(lat, lon):
+    """经纬度 → 结构化地址（高德逆地理编码）。失败返回空串。带服务端缓存。
+    入参为 WGS-84（浏览器 GPS），内部自动转 GCJ-02 再调用高德。"""
+    if not AMAP_KEY:
+        return ""
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return ""
+    # 缓存键：WGS-84 经纬度保留 4 位小数（约 11m 精度），同一地点复用
+    key = f"{lat:.4f},{lon:.4f}"
+    cached = _regeo_cache.get(key)
+    if cached and (datetime.now().timestamp() - cached.get("ts", 0) < _REGO_CACHE_TTL):
+        return cached.get("address", "")
+    try:
+        # WGS-84 → GCJ-02，再传给高德（高德只认火星坐标系）
+        gcj_lng, gcj_lat = _wgs84_to_gcj02(lon, lat)
+        url = (
+            f"https://restapi.amap.com/v3/geocode/regeo"
+            f"?key={AMAP_KEY}&location={gcj_lng:.6f},{gcj_lat:.6f}&extensions=base"
+        )
+        req = Request(url, headers={"User-Agent": "QuietShield/1.0"})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if str(data.get("status")) == "1":
+            addr = data.get("regeocode", {}).get("formatted_address", "")
+            if addr:
+                _regeo_cache[key] = {"address": addr, "ts": datetime.now().timestamp()}
+                return addr
+    except Exception as e:
+        print(f"[regeo] 逆地理编码失败: {e}")
+    return ""
 
 
 def safe_token(s, fallback="unknown"):
@@ -151,6 +232,7 @@ async function playBoostAudio(dataUrl, boostGain=6.0){
 <body>
 <h2>噪声监测日志</h2>
 <p>《噪声污染防治法》扰民噪声：白天(>=6点 &lt;22点) &gt; 55 dB(A)；夜间 &gt; 45 dB(A)；录像由 /review.html 回看。日志创建时间：{boot_time}</p>
+<p id="locLine" style="background:#eef;padding:6px 10px;border-radius:4px;font-size:13px;">📍 位置：{loc_line}</p>
 <table>
 <thead>
 <tr>
@@ -158,8 +240,6 @@ async function playBoostAudio(dataUrl, boostGain=6.0){
 <th>标签</th>
 <th>持续秒</th>
 <th>峰值dB</th>
-<th>纬度</th>
-<th>经度</th>
 <th>录音</th>
 <th>客户端IP</th>
 <th>UA</th>
@@ -180,10 +260,10 @@ class MyHandler(SimpleHTTPRequestHandler):
         self._set_cors()
         self.end_headers()
 
-    def _init_daily_html_log(self, log_file_path):
+    def _init_daily_html_log(self, log_file_path, loc_line="待首条记录写入后更新"):
         if not os.path.exists(log_file_path):
             boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = HTML_HEADER.replace("{boot_time}", boot_time)
+            header = HTML_HEADER.replace("{boot_time}", boot_time).replace("{loc_line}", html.escape(loc_line))
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.write(header)
 
@@ -317,6 +397,18 @@ class MyHandler(SimpleHTTPRequestHandler):
         except Exception:
             traceback.print_exc()
 
+    def _handle_regeo(self, parsed):
+        """经纬度 → 地址（高德逆地理编码），GET /api/regeo?lat=&lon="""
+        qs = parse_qs(parsed.query)
+        lat = qs.get("lat", [None])[0]
+        lon = qs.get("lon", [None])[0]
+        addr = reverse_geocode(lat, lon)
+        self.send_response(200)
+        self._set_cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": bool(addr), "address": addr}, ensure_ascii=False).encode("utf-8"))
+
     def _handle_videos_list(self):
         # 汇总：webm 分片 + 合并后的 10 分钟 MP4（{标签}_{开始}_{结束}_第N段.mp4）
         sessions = []
@@ -411,18 +503,29 @@ class MyHandler(SimpleHTTPRequestHandler):
         timeText = html.escape(payload.get("timeText", ""))
         durSec = html.escape(payload.get("durationSec", ""))
         peakDb = html.escape(payload.get("peakDb", ""))
-        lat = html.escape(str(payload.get("lat", "--")))
-        lon = html.escape(str(payload.get("lon", "--")))
+        lat_raw = payload.get("lat")
+        lon_raw = payload.get("lon")
+        # 后端逆地理编码：经纬度 → 地址（带服务端缓存，避免重复调用高德 API）
+        address = ""
+        if lat_raw is not None and lon_raw is not None:
+            address = reverse_geocode(lat_raw, lon_raw)
+        lat = html.escape(str(lat_raw if lat_raw is not None else "--"))
+        lon = html.escape(str(lon_raw if lon_raw is not None else "--"))
+        loc_title = f"{lat}, {lon}"
+        if address:
+            loc_title = f"{address}（{lat}, {lon}）"
+        # 若日志文件刚创建，用首条记录的位置更新抬头位置行
+        loc_line = address or f"{lat}, {lon}"
+        if not os.path.exists(html_log_path):
+            self._init_daily_html_log(html_log_path, loc_line)
 
         timeTs_esc = html.escape(str(payload.get("timeTs", "")))
         tr_html = (
             f'<tr id="log-{timeTs_esc}">'
-            f"<td>{timeText}</td>"
+            f'<td title="📍 {html.escape(loc_title)}">{timeText}</td>'
             f"<td>{tag}</td>"
             f"<td>{durSec}</td>"
             f"<td>{peakDb}</td>"
-            f"<td>{lat}</td>"
-            f"<td>{lon}</td>"
             f"<td>{audio_html}</td>"
             f"<td>{remote_ip}</td>"
             f'<td title="{ua}">{ua_disp}</td>'
@@ -440,7 +543,8 @@ class MyHandler(SimpleHTTPRequestHandler):
             _eh = -1
         if 1 <= _eh < 6:
             early_path = get_log_write_path(get_early_morning_log_filename())
-            self._init_daily_html_log(early_path)
+            if not os.path.exists(early_path):
+                self._init_daily_html_log(early_path, loc_line)
             with _io_lock:
                 with open(early_path, "a", encoding="utf-8") as f:
                     f.write(tr_html)
@@ -509,6 +613,9 @@ class MyHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/videos":
             self._handle_videos_list()
+            return
+        if path == "/api/regeo":
+            self._handle_regeo(parsed)
             return
         super().do_GET()
 

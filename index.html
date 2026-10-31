@@ -60,9 +60,10 @@
       <button class="btn red" id="btnClear">清空日志</button>
       <button class="btn green" id="btnExport">导出 HTML 报告</button>
     </div>
+    <div class="loc-bar" id="logLocBar">📍 位置：<span id="logLocText">定位中…</span></div>
     <div class="log"><table>
       <colgroup>
-        <col class="t"><col class="tag"><col class="dur"><col class="d"><col class="au"><col class="m"><col class="v"><col class="op">
+        <col class="t"><col class="tag"><col class="dur"><col class="d"><col class="au"><col class="op">
       </colgroup>
       <thead>
         <tr>
@@ -71,13 +72,11 @@
           <th>持续秒</th>
           <th>峰值dB</th>
           <th>噪声录音</th>
-          <th>纬度</th>
-          <th>经度</th>
           <th>操作</th>
         </tr>
       </thead>
       <tbody id="logBody">
-        <tr><td colspan="8" class="empty">尚无记录。开始监测后，声压超过阈值持续一段时间会记入日志。</td></tr>
+        <tr><td colspan="6" class="empty">尚无记录。开始监测后，声压超过阈值持续一段时间会记入日志。</td></tr>
       </tbody>
     </table></div>
   </section>

@@ -375,10 +375,14 @@ async function closeAndSaveSession(){
   if(!validAudio(audioB64) || parseFloat(durSec) < MIN_RECORD_SEC){ resetOverSession(); return; }
   var fullTimeStr = formatFullTime(overSession.startTs);
   putMedia(overSession.startTs, audioB64); // 音频 → IndexedDB
+  var _lat = gpsLat!==null ? gpsLat.toFixed(6):null;
+  var _lon = gpsLon!==null ? gpsLon.toFixed(6):null;
+  // 记录时携带已解析的地址（后台定时器已解析，直接复用，不阻塞）
+  var _addr = currentAddress || "";
   logArr.unshift({
     timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
     peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
-    lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
+    lat: _lat, lon: _lon, address: _addr
   });
   if(logArr.length>300) logArr.length=300;
   saveLog(); renderLog();
@@ -386,7 +390,7 @@ async function closeAndSaveSession(){
     timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
     peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
     audioData: audioB64,
-    lat: gpsLat!==null ? gpsLat.toFixed(6):null, lon: gpsLon!==null ? gpsLon.toFixed(6):null
+    lat: _lat, lon: _lon
   });
   postSessionCooldownTs = Date.now();  // 事件结束进入 5 秒冷却，期内不更新背景
   resetOverSession();
@@ -582,13 +586,72 @@ function startGps(){
 }
 function stopGps(){ if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
 
-/* ---------- GPS 显示：把经纬度渲染到「实时声波」标题栏中间 ---------- */
+/* ---------- 经纬度 → 地址（后端高德逆地理编码，带浏览器缓存） ---------- */
+// 缓存版本号：后端坐标转换算法变更时递增此值，旧缓存自动失效
+var ADDR_CACHE_VERSION="v2";
+var addrCache={};          // { "lat,lon": address }
+var addrCacheLoaded=false;
+var currentAddress="";     // 当前解析到的地址（供日志抬头和记录使用）
+function loadAddrCache(){
+  if(addrCacheLoaded) return;
+  addrCacheLoaded=true;
+  try{
+    var ver=localStorage.getItem("qs_addr_cache_ver");
+    // 版本不匹配则丢弃旧缓存（修复坐标偏移等问题后需更新版本号）
+    if(ver!==ADDR_CACHE_VERSION){
+      localStorage.removeItem("qs_addr_cache");
+      localStorage.setItem("qs_addr_cache_ver", ADDR_CACHE_VERSION);
+      addrCache={};
+      return;
+    }
+    var raw=localStorage.getItem("qs_addr_cache");
+    if(raw) addrCache=JSON.parse(raw)||{};
+  }catch(e){ addrCache={}; }
+}
+function saveAddrCache(){
+  try{ localStorage.setItem("qs_addr_cache", JSON.stringify(addrCache)); }catch(e){}
+}
+/* 经纬度保留 4 位小数做缓存键（约 11m 精度），避免同一地点重复请求后端 */
+function addrCacheKey(lat,lon){ return lat.toFixed(4)+","+lon.toFixed(4); }
+async function resolveAddress(lat,lon){
+  if(lat==null||lon==null) return "";
+  loadAddrCache();
+  var key=addrCacheKey(lat,lon);
+  if(addrCache[key]) return addrCache[key];
+  try{
+    var resp=await fetch("/api/regeo?lat="+lat+"&lon="+lon);
+    var data=await resp.json();
+    if(data.ok && data.address){
+      addrCache[key]=data.address;
+      saveAddrCache();
+      return data.address;
+    }
+  }catch(e){ console.warn("地址解析失败",e); }
+  return "";
+}
+
+/* ---------- GPS 显示：把经纬度+地址渲染到「实时声波」标题栏中间 ---------- */
+var gpsAddrTimer=null;
+async function refreshGpsAddress(){
+  if(gpsLat==null||gpsLon==null) return;
+  var addr=await resolveAddress(gpsLat,gpsLon);
+  currentAddress=addr;
+  // 同步更新日志抬头的位置显示
+  var logLoc=$("logLocText");
+  if(logLoc){
+    logLoc.textContent = addr ? (addr+"（"+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)+"）") : (gpsLat.toFixed(5)+", "+gpsLon.toFixed(5));
+  }
+}
 function updateGpsDisplay(){
   var el=$("gpsDisp");
   if(!el) return;
   if(gpsLat!==null && gpsLon!==null){
-    el.textContent="📍 "+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5);
+    var base="📍 "+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5);
+    if(currentAddress) base = "📍 "+currentAddress+"  ·  "+gpsLat.toFixed(4)+", "+gpsLon.toFixed(4);
+    el.textContent=base;
     el.style.color="var(--cyan)";
+    // 后台异步解析地址（解析成功后下次刷新时显示）
+    if(!gpsAddrTimer){ gpsAddrTimer=setInterval(refreshGpsAddress,3000); refreshGpsAddress(); }
   } else {
     el.textContent="📍 定位中…";
     el.style.color="";
@@ -887,19 +950,19 @@ window.playBoostAudio = playBoostAudio;
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
   var b=$("logBody");
-  if(!logArr.length){ b.innerHTML='<tr><td colspan="8" class="empty">尚无记录。</td></tr>'; return; }
+  if(!logArr.length){ b.innerHTML='<tr><td colspan="6" class="empty">尚无记录。</td></tr>'; return; }
   b.innerHTML="";
   for(var i=0;i<logArr.length;i++){
     var r=logArr[i];
     var tr=document.createElement("tr"); tr.className="alarm";
+    // 地址 + 经纬度作为悬停提示（行内不再单列经纬度）
+    var locTip = r.address ? (r.address+"（"+r.lat+", "+r.lon+"）") : ((r.lat!=null?r.lat:"--")+", "+(r.lon!=null?r.lon:"--"));
     tr.innerHTML=
-      '<td>'+(r.timeText||"--")+'</td>'+
+      '<td title="📍 '+locTip.replace(/"/g,'&quot;')+'">'+(r.timeText||"--")+'</td>'+
       '<td>'+(r.tag||"--")+'</td>'+
       '<td>'+(r.durationSec||"N/A")+'s</td>'+
       '<td>'+r.peakDb+'</td>'+
       '<td class="au"><span class="muted">—</span></td>'+
-      '<td>'+(r.lat!=null?r.lat:"--")+'</td>'+
-      '<td>'+(r.lon!=null?r.lon:"--")+'</td>'+
       '<td><button type="button" class="au-btn del-btn">删除</button></td>';
     b.appendChild(tr);
     // 音频从 IndexedDB 异步取回，取到后填充播放控件
@@ -943,14 +1006,13 @@ async function exportHtmlReport(){
     var audioHtml = audioData
       ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src,6.0);">🔊 降噪增强播放</button>`
       : '<span style="color:#888">无录音片段</span>';
+    var locTip = rec.address ? (rec.address+"（"+rec.lat+", "+rec.lon+"）") : ((rec.lat!=null?rec.lat:"--")+", "+(rec.lon!=null?rec.lon:"--"));
     rows += `<tr style="border-bottom:#ccc 1px solid;">
-  <td style="padding:6px 8px">${rec.timeText}</td>
+  <td style="padding:6px 8px" title="📍 ${locTip.replace(/"/g,'&quot;')}">${rec.timeText}</td>
   <td style="padding:6px 8px">${rec.tag||"--"}</td>
   <td style="padding:6px 8px">${rec.durationSec||"N/A"} s</td>
   <td style="padding:6px 8px">${rec.peakDb} dB</td>
   <td style="padding:6px 8px">${audioHtml}</td>
-  <td style="padding:6px 8px">${rec.lat!=null?rec.lat:"--"}</td>
-  <td style="padding:6px 8px">${rec.lon!=null?rec.lon:"--"}</td>
 </tr>
 `;
   }
@@ -992,7 +1054,8 @@ async function playBoostAudio(dataUrl, boostGain=6.0){
 </script>
 </head><body><h2>${reportTitle}</h2>
 <p>当前阈值：&gt;${thr} dB；最小记录时长：${MIN_RECORD_SEC}s；录像分片见后台 /review.html</p>
-<table><thead><tr><th>触发时间</th><th>标签</th><th>持续秒数</th><th>峰值dB</th><th>噪声录音</th><th>纬度</th><th>经度</th></tr></thead>
+<p style="background:#eef;padding:6px 10px;border-radius:4px;font-size:13px;">📍 位置：${currentAddress||"--"}（${gpsLat!=null?gpsLat.toFixed(5):"--"}, ${gpsLon!=null?gpsLon.toFixed(5):"--"}）</p>
+<table><thead><tr><th>触发时间</th><th>标签</th><th>持续秒数</th><th>峰值dB</th><th>噪声录音</th></tr></thead>
 <tbody>${rows}</tbody></table></body></html>`;
   var blob=new Blob([htmlOut],{type:"text/html;charset=utf-8"});
   var a=document.createElement("a");

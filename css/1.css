@@ -85,7 +85,9 @@ canvas#scope{display:block;width:100%;height:80px;background:#080C10;border-radi
 .btn.red{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.45)}
 .btn.warn{background:rgba(245,166,35,.12);color:var(--amber);border-color:rgba(245,166,35,.5)}
 .btn[disabled]{opacity:.4;pointer-events:none}
-.log{max-height:260px;overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:8px}
+.loc-bar{font-size:12px;font-family:var(--mono);color:var(--text);background:rgba(0,150,200,.12);border:1px solid var(--line);border-radius:8px;padding:6px 12px;margin:8px 0 0;word-break:break-all}
+.loc-bar #logLocText{color:var(--cyan)}
+.log{max-height:260px;overflow:auto;margin-top:8px;border:1px solid var(--line);border-radius:8px}
 table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;table-layout:fixed}
 colgroup col.t{width:20%}
 colgroup col.tag{width:9%}
