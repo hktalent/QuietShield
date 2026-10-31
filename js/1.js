@@ -630,31 +630,23 @@ async function resolveAddress(lat,lon){
   return "";
 }
 
-/* ---------- GPS 显示：把经纬度+地址渲染到「实时声波」标题栏中间 ---------- */
+/* ---------- GPS 地址解析：结果渲染到日志区上方的位置抬头 ---------- */
 var gpsAddrTimer=null;
 async function refreshGpsAddress(){
   if(gpsLat==null||gpsLon==null) return;
   var addr=await resolveAddress(gpsLat,gpsLon);
   currentAddress=addr;
-  // 同步更新日志抬头的位置显示
+  // 更新日志抬头的位置显示（经纬度+地址）
   var logLoc=$("logLocText");
   if(logLoc){
     logLoc.textContent = addr ? (addr+"（"+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)+"）") : (gpsLat.toFixed(5)+", "+gpsLon.toFixed(5));
   }
 }
 function updateGpsDisplay(){
-  var el=$("gpsDisp");
-  if(!el) return;
-  if(gpsLat!==null && gpsLon!==null){
-    var base="📍 "+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5);
-    if(currentAddress) base = "📍 "+currentAddress+"  ·  "+gpsLat.toFixed(4)+", "+gpsLon.toFixed(4);
-    el.textContent=base;
-    el.style.color="var(--cyan)";
-    // 后台异步解析地址（解析成功后下次刷新时显示）
-    if(!gpsAddrTimer){ gpsAddrTimer=setInterval(refreshGpsAddress,3000); refreshGpsAddress(); }
-  } else {
-    el.textContent="📍 定位中…";
-    el.style.color="";
+  // GPS 定位成功后启动地址解析定时器（结果显示在日志区上方）
+  if(gpsLat!==null && gpsLon!==null && !gpsAddrTimer){
+    gpsAddrTimer=setInterval(refreshGpsAddress,3000);
+    refreshGpsAddress();
   }
 }
 
