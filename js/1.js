@@ -651,23 +651,16 @@ function updateGpsDisplay(){
   }
 }
 
-/* —— 常驻初始化：首次用户交互即启动麦克风（dB 动态显示）与 GPS —— */
+/* —— 常驻初始化：首次用户交互即启动 GPS（音视频等点「开始监测」才开启）—— */
 var alwaysOnInited=false;
 function initAlwaysOn(){
   if(alwaysOnInited) return;
   alwaysOnInited=true;
-  // 启动 GPS（页面加载即可定位，不依赖监测按钮）
+  // 仅启动 GPS（定位不属于音视频，页面加载即可定位）
+  // 麦克风/摄像头不在此开启，等用户点「开始监测」后才开启
   startGps();
   setInterval(updateGpsDisplay, 1000);
   updateGpsDisplay();
-  // 请求麦克风权限并初始化音频分析（需用户手势，点击页面任意位置触发）
-  ensureStream().then(function(){
-    if(audioCtx && audioCtx.state==='suspended') audioCtx.resume();
-    liveLoop();   // 启动持续 dB 显示循环
-  }).catch(function(err){
-    console.warn("常驻音频初始化失败", err);
-    alwaysOnInited=false;   // 允许下次交互重试
-  });
 }
 
 /* ---------- 屏幕常亮 ---------- */
@@ -834,7 +827,7 @@ var startPending=false, stopPending=false;
 async function startMonitor(){
   if(running || startPending) return;
   startPending=true;
-  initAlwaysOn();   // 确保麦克风与GPS已常驻运行（首次点击也能触发）
+  initAlwaysOn();   // 确保 GPS 已启动（麦克风/摄像头由下方 ensureStream 在点击后开启）
   acquireWakeLock(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0; calArr=[]; postSessionCooldownTs=0;
   var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 10 : 2;  // 凌晨 1-6 点 10s 校准，白天快速 2s
@@ -862,8 +855,8 @@ async function stopMonitor(){
   await closeAndSaveSession();
   stopRingRecording();                             // 停止滑块缓存录音
   releaseWakeLock();                                // 释放屏幕常亮，监测停止后可正常休眠
-  // 注意：不调用 releaseStream() / stopGps()，保持麦克风与GPS持续运行，
-  // 以便 dB 数值与经纬度在停止监测后仍持续动态显示
+  releaseStream();                                  // 停止监测即释放麦克风/摄像头，回到未开启音视频的状态
+  // 注意：不调用 stopGps()，GPS 持续运行，经纬度在停止监测后仍持续显示
 }
 
 /* ---------- 日志渲染 ---------- */
@@ -1105,8 +1098,8 @@ window.addEventListener("resize", function(){
   drawScope();
 });
 
-// —— 首次用户交互即启动常驻音频（dB 动态显示）与 GPS ——
-// 浏览器要求 getUserMedia 必须由用户手势触发，故监听首次点击/触摸
+// —— 首次用户交互即启动 GPS（定位）——
+// 麦克风/摄像头不提前开启，等用户点「开始监测」后才请求权限
 function _onFirstInteraction(){
   initAlwaysOn();
   document.removeEventListener("click", _onFirstInteraction);
