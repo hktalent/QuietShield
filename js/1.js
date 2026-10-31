@@ -417,7 +417,7 @@ function processOverThreshold(currentDb){
     //      未勾选→维持原逻辑（凌晨=45或背景+6；其他时段=固定阈值）
     var gapOn = !!($("dbGapCb") && $("dbGapCb").checked);
     var gapVal = gapOn ? (parseFloat($("dbGapIn").value)||6) : 0;
-    var pass = gapOn ? (currentDb > thr || currentDb > (noiseFloorDb + gapVal))
+    var pass = gapOn ? (currentDb > thr || currentDb>39 && currentDb > (noiseFloorDb + gapVal))
                      : (early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr));
     if(pass){
       overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
