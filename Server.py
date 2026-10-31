@@ -160,17 +160,7 @@ HTML_HEADER = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>噪声监测服务端日志 {boot_time}</title>
-<style>
-body{{font-family:system-ui,monospace;padding:16px;background:#f8f8f8;color:#111;}}
-h2{{margin-bottom:12px;}}
-table{{border-collapse:collapse;width:100%;font-size:12px;}}
-th{{background:#222;color:#fff;padding:8px;text-align:left;}}
-td{{background:#fff;padding:6px 8px;border-bottom:#ccc 1px solid;}}
-tbody tr:nth-child(even) td{{background:#fffacd;}}
-tbody tr:hover td{{background:#ffe97a!important;}}
-audio{{vertical-align:middle;height:28px;max-width:240px;}}
-button{{padding:3px 6px;font-size:11px;cursor:pointer;}}
-</style>
+<link href=../css/1.css rel=stylesheet>
 <script>
 let playBoostAudioCtx = null;
 /* 5 倍音量播放：仅增益 + 限幅，不做任何降噪处理 */
@@ -203,7 +193,7 @@ async function playSimpleBoostAudio(dataUrl, boostGain=5.0){
 <body>
 <h2>噪声监测日志</h2>
 <p>《噪声污染防治法》扰民噪声：白天(>=6点 &lt;22点) &gt; 55 dB(A)；夜间 &gt; 45 dB(A)；录像由 /review.html 回看。日志创建时间：{boot_time}</p>
-<p id="locLine" style="background:#eef;padding:6px 10px;border-radius:4px;font-size:13px;">📍 位置：{loc_line}</p>
+<p id="locLine" class="loc-bar">📍 位置：{loc_line}</p>
 <table>
 <thead>
 <tr>
@@ -241,6 +231,26 @@ class MyHandler(SimpleHTTPRequestHandler):
             header = HTML_HEADER.replace("{boot_time}", boot_time).replace("{loc_line}", html.escape(loc))
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.write(header)
+
+    def _patch_log_css(self, log_file_path):
+        """修补已有日志文件的 CSS：补入隔行换色 + 悬停高亮样式"""
+        if not os.path.exists(log_file_path):
+            return
+        try:
+            with _io_lock:
+                with open(log_file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "nth-child" in content:
+                    return  # 已有样式，无需修补
+                zebra_css = (
+                    "tbody tr:nth-child(even) td{background:#fffacd;}"
+                    "tbody tr:hover td{background:#ffe97a!important;}"
+                )
+                content = content.replace("</style>", zebra_css + "</style>", 1)
+                with open(log_file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+        except Exception as e:
+            print(f"[修补日志CSS失败] {log_file_path}: {e}")
 
     def _update_log_location(self, log_file_path, loc_line):
         """回填日志抬头的位置行：把占位符/旧坐标替换为解析后的地址"""
@@ -518,9 +528,12 @@ class MyHandler(SimpleHTTPRequestHandler):
         file_existed = os.path.exists(html_log_path)
         if not file_existed:
             self._init_daily_html_log(html_log_path, loc_line)
-        elif address:
-            # 文件已存在且本次解析到地址：回填抬头位置行（替换占位符/旧坐标）
-            self._update_log_location(html_log_path, address)
+        else:
+            # 文件已存在：修补旧文件的 CSS（隔行换色 + 悬停高亮）
+            self._patch_log_css(html_log_path)
+            if address:
+                # 回填抬头位置行（替换占位符/旧坐标）
+                self._update_log_location(html_log_path, address)
 
         timeTs_esc = html.escape(str(payload.get("timeTs", "")))
         tr_html = (
@@ -548,8 +561,10 @@ class MyHandler(SimpleHTTPRequestHandler):
             early_path = get_log_write_path(get_early_morning_log_filename())
             if not os.path.exists(early_path):
                 self._init_daily_html_log(early_path, loc_line)
-            elif address:
-                self._update_log_location(early_path, address)
+            else:
+                self._patch_log_css(early_path)
+                if address:
+                    self._update_log_location(early_path, address)
             with _io_lock:
                 with open(early_path, "a", encoding="utf-8") as f:
                     f.write(tr_html)

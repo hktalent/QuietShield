@@ -413,15 +413,16 @@ function processOverThreshold(currentDb){
   var triggerLevel = noiseFloorDb + TRIG_OFFSET;
   var hh = new Date().getHours();
   var early = (hh >= 1 && hh < 6);   // 凌晨 01:00~06:00 前
+  // 每次都读取开关状态，确保会话进行中切换也能正确判定结束线
+  var gapOn = !!($("dbGapCb") && $("dbGapCb").checked);
+  var gapVal = gapOn ? (parseFloat($("dbGapIn").value)||6) : 0;
   if(!overSession.active){
     fallTs = null;
-    if(noiseFloorSamples < noiseFloorCalSec*10) return;
     setThr();
-    // 触发：勾选"背景声+X dB记录"→所有时段 噪声>背景声+XdB 或 超固定阈值，任一即触发；
+    // 触发：勾选"背景声+X dB记录"→噪声>背景声+XdB 或 超固定阈值，任一即触发；
     //      未勾选→维持原逻辑（凌晨=45或背景+6；其他时段=固定阈值）
-    var gapOn = !!($("dbGapCb") && $("dbGapCb").checked);
-    var gapVal = gapOn ? (parseFloat($("dbGapIn").value)||6) : 0;
-    var pass = gapOn ? (currentDb > thr || currentDb>39 && currentDb > (noiseFloorDb + gapVal))
+    // 注：不再等待校准完成，检测立即生效；noiseFloorDb 初始 30dB，后台持续校准更新
+    var pass = gapOn ? (currentDb > thr || currentDb > (noiseFloorDb + gapVal))
                      : (early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr));
     if(pass){
       overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
@@ -432,7 +433,7 @@ function processOverThreshold(currentDb){
     if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
     // 结束线：勾选背景+X时=背景+3；未勾选时 凌晨=背景+3 / 其他=固定阈值-5dB滞回
     var releaseLevel = gapOn ? (noiseFloorDb + RELEASE_OFFSET)
-                             : (early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS));   // 勾选=背景+3；未勾选 凌晨=背景+3/其他=阈值-5dB
+                             : (early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS));
     if(currentDb > releaseLevel){ fallTs=null; }
     else {
       if(fallTs===null) fallTs=nowTs;
