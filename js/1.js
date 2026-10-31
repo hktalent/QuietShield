@@ -4,7 +4,7 @@
 // 底噪上下限，防止漂移
 const MIN_NOISE_FLOOR = 25;
 const MAX_NOISE_FLOOR = 60;
-const CAL = 93;   // 校准偏移：由 103 降至 93，使读数整体下移约 10dB，与手机声贝 app 接近
+const CAL = 96;   // 校准偏移：由 103 降至 93，使读数整体下移约 10dB，与手机声贝 app 接近
 const DB_OFFSET = 94;
 
 var wakeLockSentinel = null;
