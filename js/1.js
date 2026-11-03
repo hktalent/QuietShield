@@ -391,7 +391,8 @@ async function closeAndSaveSession(){
     timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
     peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
     audioData: audioB64,
-    lat: _lat, lon: _lon
+    lat: _lat, lon: _lon,
+    address: _addr   // 客户端已转换好的地址，服务端直接写入日志，不再重复解析
   });
   postSessionCooldownTs = Date.now();  // 事件结束进入 5 秒冷却，期内不更新背景
   resetOverSession();
@@ -590,10 +591,11 @@ function stopGps(){ if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsW
 
 /* ---------- 经纬度 → 地址（后端高德逆地理编码，带浏览器缓存） ---------- */
 // 缓存版本号：后端坐标转换算法变更时递增此值，旧缓存自动失效
-var ADDR_CACHE_VERSION="v2";
+var ADDR_CACHE_VERSION="v3";
 var addrCache={};          // { "lat,lon": address }
 var addrCacheLoaded=false;
 var currentAddress="";     // 当前解析到的地址（供日志抬头和记录使用）
+var lastAddrLat=null, lastAddrLon=null; // 最近一次成功解析地址的坐标
 function loadAddrCache(){
   if(addrCacheLoaded) return;
   addrCacheLoaded=true;
@@ -613,8 +615,8 @@ function loadAddrCache(){
 function saveAddrCache(){
   try{ localStorage.setItem("qs_addr_cache", JSON.stringify(addrCache)); }catch(e){}
 }
-/* 经纬度保留 4 位小数做缓存键（约 11m 精度），避免同一地点重复请求后端 */
-function addrCacheKey(lat,lon){ return lat.toFixed(4)+","+lon.toFixed(4); }
+/* 经纬度保留 3 位小数做缓存键（约 100m），同一地点（含 GPS 抖动）复用同一地址 */
+function addrCacheKey(lat,lon){ return lat.toFixed(3)+","+lon.toFixed(3); }
 async function resolveAddress(lat,lon){
   if(lat==null||lon==null) return "";
   loadAddrCache();
@@ -628,26 +630,53 @@ async function resolveAddress(lat,lon){
       saveAddrCache();
       return data.address;
     }
-  }catch(e){ console.warn("地址解析失败",e); }
-  return "";
+  }catch(e){
+    console.warn("地址解析失败，稍后自动重试",e);
+  }
+  return "";   // 失败不落缓存：定时器会持续重试，直到拿到地址
+}
+
+/* 两点间距离（米）：用于判断是否还在同一地点 */
+function gpsDistanceM(lat1,lon1,lat2,lon2){
+  var R=6371000, rad=Math.PI/180;
+  var dLat=(lat2-lat1)*rad, dLon=(lon2-lon1)*rad;
+  var a=Math.sin(dLat/2)*Math.sin(dLat/2)
+      +Math.cos(lat1*rad)*Math.cos(lat2*rad)*Math.sin(dLon/2)*Math.sin(dLon/2);
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+function renderGpsLoc(addr){
+  var logLoc=$("logLocText");
+  if(!logLoc) return;
+  logLoc.textContent = addr
+    ? (addr+"（"+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)+"）")
+    : (gpsLat.toFixed(5)+", "+gpsLon.toFixed(5));
 }
 
 /* ---------- GPS 地址解析：结果渲染到日志区上方的位置抬头 ---------- */
 var gpsAddrTimer=null;
 async function refreshGpsAddress(){
   if(gpsLat==null||gpsLon==null) return;
-  var addr=await resolveAddress(gpsLat,gpsLon);
-  currentAddress=addr;
-  // 更新日志抬头的位置显示（经纬度+地址）
-  var logLoc=$("logLocText");
-  if(logLoc){
-    logLoc.textContent = addr ? (addr+"（"+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)+"）") : (gpsLat.toFixed(5)+", "+gpsLon.toFixed(5));
+  // 同一地点（位移 <200m）且已有地址：直接复用，不做重复逆地理编码
+  if(currentAddress && lastAddrLat!==null &&
+     gpsDistanceM(gpsLat,gpsLon,lastAddrLat,lastAddrLon)<200){
+    renderGpsLoc(currentAddress);
+    return;
   }
+  var addr=await resolveAddress(gpsLat,gpsLon);
+  if(addr){
+    currentAddress=addr;
+    lastAddrLat=gpsLat; lastAddrLon=gpsLon;
+    renderGpsLoc(addr);
+    return;
+  }
+  // 解析失败：继续由定时器重试；若已离上次解析点较远，先只显示坐标，避免显示旧地址
+  var far=lastAddrLat!==null && gpsDistanceM(gpsLat,gpsLon,lastAddrLat,lastAddrLon)>=200;
+  renderGpsLoc(far ? "" : currentAddress);
 }
 function updateGpsDisplay(){
-  // GPS 定位成功后启动地址解析定时器（结果显示在日志区上方）
+  // GPS 定位成功后启动地址解析定时器（结果显示在日志区上方，失败会自动重试直到成功）
   if(gpsLat!==null && gpsLon!==null && !gpsAddrTimer){
-    gpsAddrTimer=setInterval(refreshGpsAddress,3000);
+    gpsAddrTimer=setInterval(refreshGpsAddress,10000);
     refreshGpsAddress();
   }
 }
@@ -861,9 +890,9 @@ async function stopMonitor(){
 }
 
 /* ---------- 日志渲染 ---------- */
-/* 播放函数 playClearAudio（降噪清晰播放）/ playBoostAudio（5倍音量播放）已抽到
+/* 播放函数 _loadAudioBuffer/playRawAudio/playClearAudio/playBoostAudio 已抽到
  * js/player.js（顶层全局函数，index.html 先于本文件加载）。本文件的行内 onclick
- * 直接调用全局函数；exportHtmlReport 用 playClearAudio.toString() 自包含嵌入导出报告。 */
+ * 直接调用全局函数；exportHtmlReport 用它们的 toString() 自包含嵌入导出报告。 */
 
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
@@ -945,6 +974,10 @@ audio{vertical-align:middle;}button{padding:3px 6px;font-size:11px;cursor:pointe
 .au-ico{padding:1px 5px;font-size:13px;line-height:1.4;margin-right:3px;}
 </style>
 <script>
+var _decodeAudio = ${_decodeAudio.toString()};
+var _nativeFallback = ${_nativeFallback.toString()};
+var _loadAudioBuffer = ${_loadAudioBuffer.toString()};
+var playRawAudio = ${playRawAudio.toString()};
 var playClearAudio = ${playClearAudio.toString()};
 var playBoostAudio = ${playBoostAudio.toString()};
 </script>
