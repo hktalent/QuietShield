@@ -377,6 +377,7 @@ async function closeAndSaveSession(){
   putMedia(overSession.startTs, audioB64); // 音频 → IndexedDB
   var _lat = gpsLat!==null ? gpsLat.toFixed(6):null;
   var _lon = gpsLon!==null ? gpsLon.toFixed(6):null;
+  if(overSession.peakDb.toFixed(1) <39)return;// 峰值太小的噪声就直接放弃
   // 记录时携带已解析的地址（后台定时器已解析，直接复用，不阻塞）
   var _addr = currentAddress || "";
   logArr.unshift({
