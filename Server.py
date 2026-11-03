@@ -762,9 +762,8 @@ def build_offline_log_html(meta):
 <tbody id="logBody"></tbody>
 </table>
 <div class="pgbar" id="pgbar2"></div>
-<p class="note">本文件与同目录 js/、data/、audio/ 一起构成离线证据包：无需服务器，双击 index.html 即可分页浏览与播放录音。</p>
+<p class="note">本文件与同目录 js/、data/、audio/ 构成离线证据包：双击 index.html 即可分页浏览，原始播放可直接收听；「5 倍音量 / 降噪清晰」需通过本地服务器打开（浏览器安全策略禁止在 file:// 下读取并处理本地音频），例如在该目录执行 python3 -m http.server 8000 后访问 http://localhost:8000/ 。</p>
 <script src="data/log.js"></script>
-<script src="data/audio.js"></script>
 <script src="js/player.js"></script>
 <script src="js/offline.js"></script>
 </body>
@@ -792,27 +791,22 @@ def build_offline_log_zip(stem):
         "location": latest_location_line(date),
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    payload = {"meta": meta, "records": recs}
-    # data/log.js：用 <script> 注入数据，绕开 file:// 下 fetch 被浏览器禁止的问题
-    data_js = ("window.__QS_LOG__ = " +
-               json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c") + ";\n")
-    data_json = json.dumps(payload, ensure_ascii=False, indent=1)
-    # 只打包本日志实际引用的音频，避免把整个 audio 目录塞进证据包
+    # 只打包本日志实际引用的音频，避免把整个 audio 目录塞进证据包；
+    # 音频放在 audio/ 目录，离线页通过相对路径实时 fetch 读取，不再内嵌 base64
+    # （否则 data/audio.js 会重复存放整份音频，可达数百 MB，页面打开极慢）
     audio_map = {}
-    audio_data = {}
     for r in recs:
         p = audio_path_from_url(r.get("audio"))
         if not p:
             continue
         fname = os.path.basename(p)
         audio_map[fname] = p
-        # 额外内嵌 dataURL：file:// 下浏览器禁止 fetch 本地音频文件，
-        # 内嵌后「原始 / 5倍音量 / 降噪清晰」三种播放才能在离线页中使用
-        data_url = _audio_to_data_url(r.get("audio"), r.get("mime") or "")
-        if data_url:
-            audio_data[fname] = data_url
-    audio_js = ("window.__QS_AUDIO__ = " +
-                json.dumps(audio_data, ensure_ascii=False).replace("<", "\\u003c") + ";\n")
+        r["audio"] = "audio/" + fname   # 记录字段改为离线相对路径
+    payload = {"meta": meta, "records": recs}
+    # data/log.js：用 <script> 注入数据，绕开 file:// 下 fetch 被浏览器禁止的问题
+    data_js = ("window.__QS_LOG__ = " +
+               json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c") + ";\n")
+    data_json = json.dumps(payload, ensure_ascii=False, indent=1)
     os.makedirs(EXPORT_DIR, exist_ok=True)
     zip_name = f"noise_log_{date}{'_early' if early else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     zip_path = os.path.join(EXPORT_DIR, zip_name)
@@ -822,7 +816,6 @@ def build_offline_log_zip(stem):
         z.writestr("js/player.js", _player_js_source())
         z.writestr("data/log.js", data_js)
         z.writestr("data/log.json", data_json)
-        z.writestr("data/audio.js", audio_js)
         for fname, p in sorted(audio_map.items()):
             z.write(p, f"audio/{fname}", compress_type=zipfile.ZIP_STORED)
     return zip_path, len(recs), len(audio_map)

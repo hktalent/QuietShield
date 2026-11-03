@@ -25,16 +25,13 @@
     return arr;
   }
 
-  function audioEl(url) {
-    var au = document.createElement("audio");
-    au.controls = true;
-    au.preload = "none";
-    au.src = "audio/" + String(url).replace(/^.*\//, "");
-    return au;
+  function audioSrc(r) {
+    return "audio/" + String(r.audio || "").replace(/^.*\//, "");
   }
 
-  /* 录音列：保留「原始播放 / 5倍音量播放 / 降噪清晰播放」三种模式。
-   * 音频以 dataURL 内嵌在 data/audio.js，file:// 下也能交给 WebAudio 解码。 */
+  /* 录音列：原生 <audio> 保证 file:// 双击也能收听原始录音；
+   * 三个按钮通过 player.js 实时读取 audio/ 目录：http 打开时 5倍/降噪可正常处理，
+   * file:// 下 fetch 失败时 player.js 会自动兜底为原生播放，不会静默无声。 */
   function audioCell(r) {
     var td = document.createElement("td");
     td.className = "au";
@@ -43,32 +40,32 @@
       td.style.color = "#888";
       return td;
     }
-    var name = String(r.audio).replace(/^.*\//, "");
-    var data = (window.__QS_AUDIO__ || {})[name];
+    var src = audioSrc(r);
+    // 原生播放器：file:// 双击也能直接播放原始录音
+    var au = document.createElement("audio");
+    au.controls = true;
+    au.preload = "none";
+    au.src = src;
+    td.appendChild(au);
     var modes = [
       ["▶", "原始播放", "playRawAudio"],
       ["🔊", "5倍音量播放", "playBoostAudio"],
       ["✨", "降噪清晰播放", "playClearAudio"]
     ];
-    if (data && typeof window.playRawAudio === "function") {
-      modes.forEach(function (m) {
-        var b = document.createElement("button");
-        b.type = "button";
-        b.className = "pbtn";
-        b.textContent = m[0];
-        b.title = m[1];
-        b.onclick = function () {
-          var fn = window[m[2]];
-          if (typeof fn === "function") {
-            try { fn(data); } catch (e) { console.warn(m[1] + "失败", e); }
-          }
-        };
-        td.appendChild(b);
-      });
-      return td;
-    }
-    // 兜底：内嵌数据缺失时用浏览器原生播放器（依赖同目录 audio/ 文件）
-    td.appendChild(audioEl(r.audio));
+    modes.forEach(function (m) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "pbtn";
+      b.textContent = m[0];
+      b.title = m[1];
+      b.onclick = function () {
+        var fn = window[m[2]];
+        if (typeof fn === "function") {
+          try { fn(src); } catch (e) { console.warn(m[1] + "失败", e); }
+        }
+      };
+      td.appendChild(b);
+    });
     return td;
   }
 
