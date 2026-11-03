@@ -10,6 +10,8 @@ import os
 import re
 import glob
 import subprocess
+import base64
+import zipfile
 import user_agents  # 解析 User-Agent → 可读的设备/系统（如 iOS 12.0 iPhone）
 import threading
 from datetime import datetime
@@ -529,6 +531,53 @@ def query_log_range(start, end):
     return [_row_to_record(r) for r in rows]
 
 
+def query_log_all(date, early=False):
+    """取某一天（可只取凌晨时段）的全部记录，按时间升序 —— 离线 ZIP 打包用"""
+    init_db()
+    where = "date=?"
+    if early:
+        where += " AND hour>=1 AND hour<6"
+    with _db_lock:
+        con = _db_conn()
+        try:
+            rows = con.execute(
+                f"SELECT * FROM records WHERE {where} ORDER BY ts ASC", (date,)).fetchall()
+        finally:
+            con.close()
+    return [_row_to_record(r) for r in rows]
+
+
+def exportable_records(recs):
+    """证据包只保留有录音且峰值大于 0 的记录（无录音/峰值 0 的整行剔除）"""
+    out = []
+    for r in recs:
+        if not r.get("audio"):
+            continue
+        try:
+            peak = float(r.get("peak") or 0)
+        except (TypeError, ValueError):
+            peak = 0.0
+        if peak <= 0:
+            continue
+        out.append(r)
+    return out
+
+
+def query_export_count(date, early=False):
+    """某天可导出的记录数（有录音且峰值 > 0），供导出界面显示"""
+    init_db()
+    where = "date=? AND audio<>'' AND peak IS NOT NULL AND peak>0"
+    if early:
+        where += " AND hour>=1 AND hour<6"
+    with _db_lock:
+        con = _db_conn()
+        try:
+            return con.execute(
+                f"SELECT COUNT(*) FROM records WHERE {where}", (date,)).fetchone()[0]
+        finally:
+            con.close()
+
+
 _EXT_MIME = {"webm": "audio/webm", "ogg": "audio/ogg", "m4a": "audio/mp4",
              "mp3": "audio/mpeg", "wav": "audio/wav"}
 
@@ -643,6 +692,168 @@ document.querySelectorAll('button[data-i]').forEach(function (b) {{
     return doc, len(recs)
 
 
+def _offline_js_source():
+    """离线 ZIP 内的分页/播放脚本（与在线 logview.js 相互独立，不依赖 fetch）"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js", "logoffline.js")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+_OFFLINE_CSS = """
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:20px;color:#222;background:#fff}
+h1{font-size:20px;margin:0 0 10px}
+.meta{background:#eef;padding:8px 12px;border-radius:6px;font-size:13px;line-height:1.8;margin-bottom:12px}
+.meta b{font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{border:1px solid #d5d9e0;padding:6px 8px;text-align:left;vertical-align:middle}
+th{background:#f4f6fa;position:sticky;top:0}
+tr:nth-child(even) td{background:#fafbfd}
+th.th-sort{cursor:pointer;user-select:none}
+.au{white-space:nowrap}
+.au audio{height:32px;max-width:240px;vertical-align:middle}
+.pbtn{font-size:13px;line-height:1;padding:5px 8px;margin-right:4px;border:1px solid #ccd;border-radius:4px;background:#fff;cursor:pointer}
+.pbtn:hover{background:#eef4ff;border-color:#8ab}
+.pgbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0}
+.pg-btn,.pg-nav{font-size:13px;padding:4px 9px;border:1px solid #ccd;border-radius:4px;background:#fff;cursor:pointer}
+.pg-btn:hover,.pg-nav:hover{background:#eef4ff;border-color:#8ab}
+.pg-btn.active{background:#2f6fed;border-color:#2f6fed;color:#fff}
+.pg-info{color:#666;font-size:12px;margin-left:6px}
+.pg-dots{color:#888}
+.note{color:#666;font-size:12px;margin-top:12px;line-height:1.7}
+"""
+
+
+def build_offline_log_html(meta):
+    """离线日志页：记录由 data/log.js 以 <script> 方式载入，
+    因此 file:// 直接双击也能分页；录音用相对路径 audio/xxx 播放。"""
+    date = html.escape(str(meta.get("date") or ""))
+    early = bool(meta.get("early"))
+    title = f"噪声监测日志 {date}" + ("（凌晨 01:00-06:00）" if early else "")
+    loc = html.escape(str(meta.get("location") or "—"))
+    count = int(meta.get("count") or 0)
+    exported = html.escape(str(meta.get("exported_at") or ""))
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}（离线证据包）</title>
+<style>{_OFFLINE_CSS}</style>
+</head>
+<body>
+<h1>{html.escape(title)}</h1>
+<div class="meta">
+<b>日期：</b>{date}　<b>记录数：</b><span id="mTotal">{count}</span>　<b>位置：</b>{loc}<br>
+判定参考：《噪声污染防治法》扰民噪声：白天(≥6点 &lt;22点) &gt; 55 dB(A)；夜间 &gt; 45 dB(A)<br>
+<b>导出时间：</b>{exported}
+</div>
+<div class="pgbar" id="pgbar"></div>
+<table>
+<thead>
+<tr>
+<th>事件触发时间</th><th>标签</th><th>持续秒</th>
+<th class="th-sort" data-sort="peak" title="点击按峰值排序（降序/升序切换）">峰值dB<span id="sortInd"></span></th>
+<th>录音</th><th>客户端IP</th><th>UA</th>
+</tr>
+</thead>
+<tbody id="logBody"></tbody>
+</table>
+<div class="pgbar" id="pgbar2"></div>
+<p class="note">本文件与同目录 js/、data/、audio/ 一起构成离线证据包：无需服务器，双击 index.html 即可分页浏览与播放录音。</p>
+<script src="data/log.js"></script>
+<script src="data/audio.js"></script>
+<script src="js/player.js"></script>
+<script src="js/offline.js"></script>
+</body>
+</html>"""
+
+
+def build_offline_log_zip(stem):
+    """按日志名（不含 .html）打包离线证据 ZIP：html + js + json + 音频。
+    返回 (zip 路径, 记录数, 音频文件数)；名称非法或日期解析失败返回 None。"""
+    stem = str(stem or "").strip()
+    if not re.fullmatch(r"noise_log_[^/\\]+", stem) or ".." in stem:
+        return None
+    m = re.match(r"noise_log_(\d{4}-\d{2}-\d{2})", stem)
+    if not m:
+        return None
+    date = m.group(1)
+    early = "凌晨" in stem
+    # 证据包只保留有录音且峰值 > 0 的记录
+    recs = exportable_records(query_log_all(date, early))
+    meta = {
+        "name": stem,
+        "date": date,
+        "early": early,
+        "count": len(recs),
+        "location": latest_location_line(date),
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    payload = {"meta": meta, "records": recs}
+    # data/log.js：用 <script> 注入数据，绕开 file:// 下 fetch 被浏览器禁止的问题
+    data_js = ("window.__QS_LOG__ = " +
+               json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c") + ";\n")
+    data_json = json.dumps(payload, ensure_ascii=False, indent=1)
+    # 只打包本日志实际引用的音频，避免把整个 audio 目录塞进证据包
+    audio_map = {}
+    audio_data = {}
+    for r in recs:
+        p = audio_path_from_url(r.get("audio"))
+        if not p:
+            continue
+        fname = os.path.basename(p)
+        audio_map[fname] = p
+        # 额外内嵌 dataURL：file:// 下浏览器禁止 fetch 本地音频文件，
+        # 内嵌后「原始 / 5倍音量 / 降噪清晰」三种播放才能在离线页中使用
+        data_url = _audio_to_data_url(r.get("audio"), r.get("mime") or "")
+        if data_url:
+            audio_data[fname] = data_url
+    audio_js = ("window.__QS_AUDIO__ = " +
+                json.dumps(audio_data, ensure_ascii=False).replace("<", "\\u003c") + ";\n")
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    zip_name = f"noise_log_{date}{'_early' if early else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_path = os.path.join(EXPORT_DIR, zip_name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("index.html", build_offline_log_html(meta))
+        z.writestr("js/offline.js", _offline_js_source())
+        z.writestr("js/player.js", _player_js_source())
+        z.writestr("data/log.js", data_js)
+        z.writestr("data/log.json", data_json)
+        z.writestr("data/audio.js", audio_js)
+        for fname, p in sorted(audio_map.items()):
+            z.write(p, f"audio/{fname}", compress_type=zipfile.ZIP_STORED)
+    return zip_path, len(recs), len(audio_map)
+
+
+def list_log_html_stems():
+    """logs/ 下所有日志 HTML 的名称（去掉 .html），按日期倒序"""
+    try:
+        names = sorted(os.listdir(LOG_DIR))
+    except OSError:
+        return []
+    items = []
+    for fn in names:
+        if not (fn.startswith("noise_log_") and fn.endswith(".html")):
+            continue
+        full = os.path.join(LOG_DIR, fn)
+        if not os.path.isfile(full):
+            continue
+        stem = fn[:-5]
+        m = re.match(r"noise_log_(\d{4}-\d{2}-\d{2})", stem)
+        date = m.group(1) if m else ""
+        early = "凌晨" in stem
+        try:
+            count = query_export_count(date, early) if date else 0
+        except Exception:
+            count = 0
+        items.append({"name": stem, "date": date, "early": early, "count": count})
+    items.sort(key=lambda x: (x["date"], x["early"], x["name"]), reverse=True)
+    return items
+
+
 def delete_log_record(ts):
     """删除一条记录并联动删除其独立音频文件，返回删除条数"""
     init_db()
@@ -723,9 +934,33 @@ def _legacy_header_location(path):
     return loc
 
 
+def _legacy_row_location(path):
+    """从旧日志行标题里取带经纬度的定位（形如“地址（30.673836, 103.962540）”）。
+    只扫描文件前 4MB（第一行就在附近），命中即停，大文件也不慢。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(4 * 1024 * 1024)
+    except OSError:
+        return ""
+    m = re.search(r'<td title="📍 ([^"]*?)">', head)
+    if not m:
+        return ""
+    loc = html.unescape(m.group(1)).strip()
+    return loc if "（" in loc else ""
+
+
+def _split_location(loc):
+    """把“地址（lat, lon）”拆成 (地址, 纬度, 经度)；无坐标则返回 (原文, None, None)"""
+    loc = str(loc or "").strip()
+    m = re.search(r"（(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)）", loc)
+    if not m:
+        return loc, None, None
+    return loc[:m.start()].strip(), float(m.group(1)), float(m.group(2))
+
+
 def backfill_locations_from_legacy():
-    """旧日志迁移时没有 addr/loc_title，但旧页抬头里有历史定位地址：
-    按日期回填进数据库，避免日志页显示“—”而丢失已知位置。"""
+    """旧日志迁移时没有 addr/loc_title，但旧页抬头/行标题里有历史定位：
+    按日期回填进数据库（优先带经纬度的行标题），避免日志页丢失已知位置。"""
     legacy_dir = os.path.join(LOG_DIR, "_legacy")
     try:
         names = sorted(os.listdir(legacy_dir))
@@ -738,7 +973,9 @@ def backfill_locations_from_legacy():
         m = re.search(r"noise_log_(\d{4}-\d{2}-\d{2})", fn)
         if not m or m.group(1) in by_date:
             continue
-        loc = _legacy_header_location(os.path.join(legacy_dir, fn))
+        full = os.path.join(legacy_dir, fn)
+        # 行标题里的地址带经纬度，比页抬头更具体，优先使用
+        loc = _legacy_row_location(full) or _legacy_header_location(full)
         if loc:
             by_date[m.group(1)] = loc
     if not by_date:
@@ -749,14 +986,19 @@ def backfill_locations_from_legacy():
             con = _db_conn()
             try:
                 for date, loc in by_date.items():
+                    addr, lat, lon = _split_location(loc)
                     con.execute(
-                        "UPDATE records SET addr=?, loc_title=? "
-                        "WHERE date=? AND addr='' AND loc_title=''",
-                        (loc, loc, date))
+                        "UPDATE records SET "
+                        "addr=CASE WHEN addr='' THEN ? ELSE addr END, "
+                        "loc_title=CASE WHEN loc_title='' OR loc_title NOT LIKE '%（%' THEN ? ELSE loc_title END, "
+                        "lat=CASE WHEN lat IS NULL THEN ? ELSE lat END, "
+                        "lon=CASE WHEN lon IS NULL THEN ? ELSE lon END "
+                        "WHERE date=?",
+                        (addr, loc, lat, lon, date))
                 con.commit()
             finally:
                 con.close()
-        print(f"[位置回填] 旧日志抬头地址已写入 {len(by_date)} 天：{', '.join(sorted(by_date))}")
+        print(f"[位置回填] 旧日志地址已写入 {len(by_date)} 天：{', '.join(sorted(by_date))}")
     except Exception as e:
         print(f"[位置回填] 失败: {e}")
 
@@ -1281,6 +1523,40 @@ class MyHandler(SimpleHTTPRequestHandler):
                                      "url": f"/logs/exports/{fname}",
                                      "size": os.path.getsize(path)}, ensure_ascii=False).encode("utf-8"))
 
+    def _send_json(self, obj, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _handle_log_files(self):
+        """GET /api/log/files —— logs/ 下的日志 HTML 名称（不含 .html），供导出界面列出"""
+        try:
+            self._send_json({"ok": True, "files": list_log_html_stems()})
+        except Exception as e:
+            self._send_json({"ok": False, "err": str(e)}, 500)
+
+    def _handle_log_zip(self, parsed):
+        """GET /api/log/zip?name=noise_log_2026-11-03
+        将该日志打包为离线证据 ZIP（index.html + js + json + audio），返回下载地址"""
+        q = parse_qs(parsed.query)
+        name = q.get("name", [""])[0]
+        try:
+            res = build_offline_log_zip(name)
+            if not res:
+                self._send_json({"ok": False, "err": "日志名称无效"}, 400)
+                return
+            path, count, n_audio = res
+            self._send_json({
+                "ok": True, "count": count, "audio": n_audio,
+                "url": f"/logs/exports/{os.path.basename(path)}",
+                "size": os.path.getsize(path),
+            })
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json({"ok": False, "err": str(e)}, 500)
+
     def _handle_videos_list(self):
         # 汇总：webm 分片 + 合并后的 10 分钟 MP4（{标签}_{开始}_{结束}_第N段.mp4）
         sessions = []
@@ -1527,6 +1803,12 @@ class MyHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/log/export":
             self._handle_log_export(parsed)
+            return
+        if path == "/api/log/files":
+            self._handle_log_files()
+            return
+        if path == "/api/log/zip":
+            self._handle_log_zip(parsed)
             return
         super().do_GET()
 

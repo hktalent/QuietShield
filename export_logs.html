@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>导出日志（ZIP 离线证据包）</title>
+<style>
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:24px;color:#222;background:#f7f8fb}
+h1{font-size:20px;margin:0 0 6px}
+.note{color:#555;font-size:13px;line-height:1.8;background:#fff;border:1px solid #e2e6ee;border-radius:8px;padding:12px 14px;margin:0 0 14px}
+.toolbar{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+button{font-size:14px;padding:7px 14px;border:1px solid #c8cfdb;border-radius:6px;background:#fff;cursor:pointer}
+button:hover{background:#eef4ff;border-color:#8ab}
+button:disabled{opacity:.55;cursor:default}
+button.primary{background:#2f6fed;border-color:#2f6fed;color:#fff}
+button.primary:hover{background:#1f5ed8}
+#msg{font-size:13px;color:#666}
+table{width:100%;border-collapse:collapse;font-size:14px;background:#fff;border:1px solid #e2e6ee;border-radius:8px;overflow:hidden}
+th,td{border-bottom:1px solid #eef1f6;padding:10px 12px;text-align:left;vertical-align:middle}
+th{background:#f4f6fa;font-weight:600}
+td .ops{display:flex;gap:8px;flex-wrap:wrap}
+td .ops a{font-size:13px;padding:6px 10px;border:1px solid #c8cfdb;border-radius:6px;text-decoration:none;color:#2f6fed;white-space:nowrap}
+td .ops a:hover{background:#eef4ff}
+.empty{color:#888;text-align:center;padding:24px}
+.tag{display:inline-block;font-size:12px;padding:1px 6px;border-radius:4px;background:#eef4ff;color:#2f6fed;margin-left:6px}
+.tag.early{background:#fff3e0;color:#c77700}
+.foot{color:#888;font-size:12px;margin-top:14px;line-height:1.7}
+</style>
+</head>
+<body>
+<h1>导出日志（ZIP 离线证据包）</h1>
+<p class="note">
+下面的列表来自服务器 <b>logs/</b> 目录（名称已去掉 .html 后缀）。点击「导出 ZIP」会打包该日志的全部记录：
+<b>index.html</b>（离线日志页，可分页、可播放）、<b>js/offline.js</b>、<b>data/log.js</b> / <b>data/log.json</b> 数据文件、以及该日志引用的 <b>audio/</b> 录音文件。<br>
+解压后<b>双击 index.html 即可离线浏览</b>，无需服务器或网络（录音通过相对路径播放）。
+</p>
+<div class="toolbar">
+  <button type="button" id="refresh">刷新列表</button>
+  <span id="msg"></span>
+</div>
+<table>
+<thead>
+<tr><th style="width:46%">日志名称（不含 .html）</th><th>日期</th><th>可导出记录</th><th style="width:30%">操作</th></tr>
+</thead>
+<tbody id="listBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+</table>
+<p class="foot">提示：导出文件保存在服务器 logs/exports/ 下；ZIP 内音频按本日志实际引用打包，不会包含无关录音。</p>
+<script>
+(function () {
+  var body = document.getElementById("listBody");
+  var msg = document.getElementById("msg");
+  var refresh = document.getElementById("refresh");
+
+  function load() {
+    body.innerHTML = '<tr><td colspan="4" class="empty">加载中…</td></tr>';
+    fetch("/api/log/files", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) throw new Error(d.err || "读取失败");
+        render(d.files || []);
+      })
+      .catch(function (e) {
+        body.innerHTML = '<tr><td colspan="4" class="empty">加载失败：' + e.message + '</td></tr>';
+      });
+  }
+
+  function render(files) {
+    body.innerHTML = "";
+    if (!files.length) {
+      body.innerHTML = '<tr><td colspan="4" class="empty">logs/ 下暂无可导出的日志 HTML</td></tr>';
+      return;
+    }
+    files.forEach(function (f) {
+      var tr = document.createElement("tr");
+
+      var td1 = document.createElement("td");
+      td1.textContent = f.name;
+      if (f.early) {
+        var t = document.createElement("span");
+        t.className = "tag early";
+        t.textContent = "凌晨";
+        td1.appendChild(t);
+      }
+      tr.appendChild(td1);
+
+      var td2 = document.createElement("td");
+      td2.textContent = f.date || "--";
+      tr.appendChild(td2);
+
+      var td3 = document.createElement("td");
+      td3.textContent = String(f.count == null ? 0 : f.count);
+      tr.appendChild(td3);
+
+      var td4 = document.createElement("td");
+      var ops = document.createElement("div");
+      ops.className = "ops";
+
+      var open = document.createElement("a");
+      open.href = "/logs/" + encodeURIComponent(f.name) + ".html";
+      open.target = "_blank";
+      open.rel = "noopener";
+      open.textContent = "打开在线日志";
+      ops.appendChild(open);
+
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "primary";
+      btn.textContent = "导出 ZIP";
+      btn.onclick = function () { exportZip(f.name, btn); };
+      ops.appendChild(btn);
+
+      td4.appendChild(ops);
+      tr.appendChild(td4);
+      body.appendChild(tr);
+    });
+  }
+
+  function exportZip(name, btn) {
+    btn.disabled = true;
+    msg.textContent = "正在打包 " + name + " …";
+    fetch("/api/log/zip?name=" + encodeURIComponent(name), { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) throw new Error(d.err || "导出失败");
+        msg.textContent = "已打包 " + d.count + " 条记录、" + d.audio + " 个录音（" +
+          (d.size / 1048576).toFixed(1) + " MB），开始下载…";
+        var a = document.createElement("a");
+        a.href = d.url;
+        a.download = "";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { msg.textContent = "已生成：" + d.url; }, 800);
+      })
+      .catch(function (e) { msg.textContent = "导出失败：" + e.message; })
+      .then(function () { btn.disabled = false; });
+  }
+
+  refresh.onclick = load;
+  load();
+})();
+</script>
+</body>
+</html>
