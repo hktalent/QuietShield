@@ -1479,9 +1479,13 @@ class MyHandler(SimpleHTTPRequestHandler):
             page = int(q.get("page", ["0"])[0])
         except ValueError:
             page = 0
+        try:
+            size = int(q.get("size", [str(PAGE_SIZE)])[0])
+        except ValueError:
+            size = PAGE_SIZE
         sort = q.get("sort", ["time"])[0]
         early = q.get("early", ["0"])[0] in ("1", "true", "yes")
-        data = query_log_page(date, page, PAGE_SIZE, sort, early)
+        data = query_log_page(date, page, size, sort, early)
         self.send_response(200)
         self._set_cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")

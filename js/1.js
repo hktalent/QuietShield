@@ -201,71 +201,10 @@ function getTag(){
   return v;
 }
 
-/* ---------- 存储 ---------- */
-// 音频等大体积媒体存 IndexedDB，localStorage 只存文字字段（避免 5MB 上限）
-var idb=null;
-function openDB(){
-  return new Promise(function(resolve,reject){
-    if(idb){ resolve(idb); return; }
-    var req=indexedDB.open("qs_media_db",1);
-    req.onupgradeneeded=function(e){
-      var db=e.target.result;
-      if(!db.objectStoreNames.contains("media"))
-        db.createObjectStore("media",{keyPath:"timeTs"});
-    };
-    req.onsuccess=function(){ idb=req.result; resolve(idb); };
-    req.onerror=function(){ reject(req.error); };
-  });
-}
-function putMedia(timeTs, audioData){
-  if(timeTs==null) return Promise.resolve();
-  return openDB().then(function(db){
-    return new Promise(function(res,rej){
-      var tx=db.transaction("media","readwrite");
-      tx.objectStore("media").put({timeTs:timeTs, audioData:audioData||null});
-      tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
-    });
-  }).catch(function(e){ console.warn("媒体写入失败",e); });
-}
-function getMedia(timeTs){
-  return openDB().then(function(db){
-    return new Promise(function(res,rej){
-      var tx=db.transaction("media","readonly");
-      var rq=tx.objectStore("media").get(timeTs);
-      rq.onsuccess=function(){ res(rq.result||null); };
-      rq.onerror=function(){ rej(rq.error); };
-    });
-  }).catch(function(){ return null; });
-}
-function getAllMedia(){
-  return openDB().then(function(db){
-    return new Promise(function(res,rej){
-      var tx=db.transaction("media","readonly");
-      var rq=tx.objectStore("media").getAll();
-      rq.onsuccess=function(){ res(rq.result||[]); };
-      rq.onerror=function(){ rej(rq.error); };
-    });
-  }).catch(function(){ return []; });
-}
-function clearMedia(){
-  return openDB().then(function(db){
-    return new Promise(function(res,rej){
-      var tx=db.transaction("media","readwrite");
-      tx.objectStore("media").clear();
-      tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
-    });
-  }).catch(function(){});
-}
-function deleteMedia(timeTs){
-  if(timeTs==null) return Promise.resolve();
-  return openDB().then(function(db){
-    return new Promise(function(res,rej){
-      var tx=db.transaction("media","readwrite");
-      tx.objectStore("media").delete(timeTs);
-      tx.oncomplete=res; tx.onerror=function(){ rej(tx.error); };
-    });
-  }).catch(function(e){ console.warn("媒体删除失败",e); });
-}
+/* ---------- 存储 ----------
+ * 音频不再存浏览器 IndexedDB / base64（长时间采集会导致 IndexedDB 开销过大，浏览器卡顿、卡死）。
+ * 录音直接上传服务器落盘到 logs/audio/，本地 logArr 只保留服务端返回的音频 URL（小字符串），
+ * 回放时由 <audio> / player.js 直接 fetch 服务器音频文件，浏览器内存不再被 base64 占满。 */
 
 function validAudio(a){
   return typeof a === "string" && a.length > 400 && a.indexOf("base64,") > 0;
@@ -273,33 +212,94 @@ function validAudio(a){
 
 function loadLog(){
   try{ var r=JSON.parse(localStorage.getItem("sm_log")||"[]"); if(Array.isArray(r)) logArr=r; }catch(e){ logArr=[]; }
-  // 迁移旧数据：若旧日志仍含媒体字段，写入 IndexedDB 并从数组剥离，只留文字
+  // 迁移旧数据：旧记录可能内嵌 base64（audioData）/波形图（waveImg），占满 localStorage；
+  // 现已不存浏览器，直接剥离大字段，并给缺失 audio 的旧记录补空串（稍后从服务端回填 URL）
   var dirty=false;
   for(var i=0;i<logArr.length;i++){
     var rec=logArr[i];
-    if(rec && (rec.audioData!==undefined || rec.waveImg!==undefined)){
-      putMedia(rec.timeTs, rec.audioData);
-      if("waveImg" in rec) delete rec.waveImg;
-      if("audioData" in rec) delete rec.audioData;
-      dirty=true;
-    }
+    if(!rec) continue;
+    if(rec.audioData!==undefined){ delete rec.audioData; dirty=true; }
+    if(rec.waveImg!==undefined){ delete rec.waveImg; dirty=true; }
+    if(typeof rec.audio !== "string"){ rec.audio = ""; dirty=true; }
   }
   if(dirty) saveLog();
   renderLog();
+  resolveAudioUrls();   // 从服务端按日期回填旧记录缺失的音频 URL
 }
 function saveLog(){
   try{ localStorage.setItem("sm_log", JSON.stringify(logArr)); }catch(e){ toast("⚠️本地存储已满"); }
 }
 loadLog();
 
-// 后台噪声日志推送（含设备ID，无磁/振）
+// 后台噪声日志推送（含设备ID，无磁/振）；成功时返回服务端落盘后的音频 URL（如 /audio/xxx.webm），失败返回空串
 const LOG_API_URL = "/api/log";
 async function pushLogToServer(record){
   try{
     record.deviceId = deviceId || "unknown";
     var resp = await fetch(LOG_API_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(record)});
     if(!resp.ok) throw new Error("HTTP status: "+resp.status);
-  }catch(err){ console.warn("推送日志失败，不影响本地", err); }
+    var data = await resp.json().catch(function(){ return {}; });
+    return (data && data.ok) ? (data.audio || "") : "";
+  }catch(err){ console.warn("推送日志失败，不影响本地", err); return ""; }
+}
+
+// 为本地 logArr 中缺失音频 URL 的记录，按日期从服务端回填（最多最近 14 天）。
+// 服务端 DB 的 ts 存的是 str(timeTs)，这里用 String(rec.timeTs) 对齐匹配。
+function resolveAudioUrls(){
+  if(!logArr.length) return;
+  var byDate = {};
+  for(var i=0;i<logArr.length;i++){
+    var rec=logArr[i];
+    if(rec && typeof rec.audio === "string" && rec.audio) continue;   // 已有 URL，跳过
+    var ts = rec && rec.timeTs;
+    if(ts==null) continue;
+    var d = new Date(ts);
+    if(isNaN(d.getTime())) continue;
+    var p=function(n){return ("0"+n).slice(-2);};
+    var key = d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate());
+    (byDate[key] = byDate[key] || []).push(ts);
+  }
+  var dates = Object.keys(byDate);
+  if(!dates.length) return;
+  var cutoff = Date.now() - 14*24*3600*1000;   // 只回填最近 14 天，避免启动时拉取过多历史
+  dates = dates.filter(function(k){ return new Date(k).getTime() >= cutoff; });
+  (function next(idx){
+    if(idx >= dates.length) return;
+    fetchLogAudioMap(dates[idx]).then(function(map){
+      var dirty=false;
+      for(var j=0;j<logArr.length;j++){
+        var r=logArr[j];
+        if(!r || (typeof r.audio === "string" && r.audio)) continue;
+        var au = map[String(r.timeTs)];
+        if(au){ r.audio = au; r._uploadErr=false; dirty=true; }
+      }
+      if(dirty){ saveLog(); renderLog(); }
+      next(idx+1);
+    }).catch(function(){ next(idx+1); });
+  })(0);
+}
+
+// 拉取某天全部记录（size=200 分页），构建 {ts: audio} 映射（只含已有 audio 的行）
+function fetchLogAudioMap(date){
+  return new Promise(function(resolve){
+    var map={};
+    (function page(p){
+      fetch("/api/log/list?date="+encodeURIComponent(date)+"&page="+p+"&size=200", {cache:"no-store"})
+        .then(function(resp){ return resp.ok ? resp.json() : {rows:[]}; })
+        .then(function(data){
+          var rows = (data && data.rows) || [];
+          for(var i=0;i<rows.length;i++){
+            var row=rows[i];
+            if(row && row.ts && row.audio) map[String(row.ts)] = row.audio;
+          }
+          var total = (data && data.total) || 0;
+          var pageSize = (data && data.size) || 200;
+          if(rows.length && (p+1)*pageSize < total){ page(p+1); }
+          else { resolve(map); }
+        })
+        .catch(function(){ resolve(map); });
+    })(0);
+  });
 }
 
 // ===== 噪声样本：分段常驻录音（每段带头可播）+ 触发前判断（dB>背景才纳入、最多2秒） =====
@@ -368,34 +368,45 @@ function stopRecordAudio(){
 }
 async function closeAndSaveSession(){
   if(!overSession.active) return;
+  var startTs = overSession.startTs;
+  var peak = overSession.peakDb;
   var nowTs = Date.now();
-  var durSec = ((nowTs - overSession.startTs)/1000).toFixed(1);
+  var durSec = ((nowTs - startTs)/1000).toFixed(1);
   var audioB64 = await stopRecordAudio();
-  // 噪声样本无效/为空，或持续时长过短 → 不记录这条日志
-  if(!validAudio(audioB64) || parseFloat(durSec) < MIN_RECORD_SEC){ resetOverSession(); return; }
-  var fullTimeStr = formatFullTime(overSession.startTs);
-  putMedia(overSession.startTs, audioB64); // 音频 → IndexedDB
+  // 样本无效/为空、持续过短、或峰值太小 → 不记录也不上传（避免无效落盘），直接结束本段
+  if(!validAudio(audioB64) || parseFloat(durSec) < MIN_RECORD_SEC || peak.toFixed(1) < 39){
+    postSessionCooldownTs = Date.now();
+    resetOverSession();
+    return;
+  }
+  var fullTimeStr = formatFullTime(startTs);
   var _lat = gpsLat!==null ? gpsLat.toFixed(6):null;
   var _lon = gpsLon!==null ? gpsLon.toFixed(6):null;
-  if(overSession.peakDb.toFixed(1) <39)return;// 峰值太小的噪声就直接放弃
   // 记录时携带已解析的地址（后台定时器已解析，直接复用，不阻塞）
   var _addr = currentAddress || "";
-  logArr.unshift({
-    timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
-    peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
-    lat: _lat, lon: _lon, address: _addr
-  });
+  // 先以 audio=""（上传中）入列渲染，待服务端返回 URL 后回填；全程不写 IndexedDB / base64
+  var rec = {
+    timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
+    peakDb: peak.toFixed(1), tag: getTag(),
+    lat: _lat, lon: _lon, address: _addr, audio: ""
+  };
+  logArr.unshift(rec);
   if(logArr.length>300) logArr.length=300;
   saveLog(); renderLog();
+  postSessionCooldownTs = Date.now();  // 事件结束进入 5 秒冷却，期内不更新背景
+  resetOverSession();
+  // 异步上传：成功回填服务端音频 URL 并重渲染；失败标记上传失败
   pushLogToServer({
-    timeText: fullTimeStr, timeTs: overSession.startTs, durationSec: durSec,
-    peakDb: overSession.peakDb.toFixed(1), tag: getTag(),
+    timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
+    peakDb: peak.toFixed(1), tag: getTag(),
     audioData: audioB64,
     lat: _lat, lon: _lon,
     address: _addr   // 客户端已转换好的地址，服务端直接写入日志，不再重复解析
+  }).then(function(audioUrl){
+    if(audioUrl){ rec.audio = audioUrl; rec._uploadErr = false; }
+    else { rec._uploadErr = true; }
+    saveLog(); renderLog();
   });
-  postSessionCooldownTs = Date.now();  // 事件结束进入 5 秒冷却，期内不更新背景
-  resetOverSession();
 }
 
 /* ===== 超标检测 ===== */
@@ -909,24 +920,29 @@ function renderLog(){
       '<td>'+(r.tag||"--")+'</td>'+
       '<td>'+(r.durationSec||"N/A")+'s</td>'+
       '<td>'+r.peakDb+'</td>'+
-      '<td class="au"><span class="muted">—</span></td>'+
+      '<td class="au"></td>'+
       '<td><button type="button" class="au-btn del-btn">删除</button></td>';
+    // 音频直接引用服务器 audio 目录的 URL（不读 IndexedDB / base64），点按钮才 fetch 播放
+    tr.querySelector(".au").innerHTML = auCellHtml(r);
     b.appendChild(tr);
-    // 音频从 IndexedDB 异步取回，取到后填充播放控件
-    (function(ts, cell){
-      if(ts==null) return;
-      getMedia(ts).then(function(m){
-        if(!cell || !m || !validAudio(m.audioData)) return;
-        cell.innerHTML='<audio controls preload="none"><source src="'+m.audioData+'" type="audio/webm">不支持</audio>'+
-          '<br><button type="button" class="au-btn au-ico" title="5倍音量播放" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playBoostAudio(s.src);">🔊</button>'+
-          '<button type="button" class="au-btn au-ico" title="降噪清晰播放" onclick="var s=this.parentElement.querySelector(\'source\');if(s)playClearAudio(s.src);">✨</button>';
-      }).catch(function(){});
-    })(r.timeTs, tr.querySelector(".au"));
-    // 删除本行：同步删前端(IndexedDB+列表)并通知后端删除对应日志
+    // 删除本行：同步删前端列表并通知后端删除对应日志
     (function(ts, btn){
       if(btn) btn.addEventListener("click", function(){ delLog(ts); });
     })(r.timeTs, tr.querySelector(".del-btn"));
   }
+}
+// 依据记录的音频状态渲染录音列：有 URL → 原生播放 + 三种模式；否则显示上传中/失败/无
+function auCellHtml(r){
+  if(r && r.audio && /^(\/|https?:)/.test(r.audio)){
+    var u=r.audio, esc=u.replace(/"/g,'&quot;'), js=u.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+    return '<audio controls preload="none" src="'+esc+'"></audio>'+
+      '<br><button type="button" class="au-btn au-ico" title="原始播放" onclick="playRawAudio(\''+js+'\')">▶</button>'+
+      '<button type="button" class="au-btn au-ico" title="5倍音量播放" onclick="playBoostAudio(\''+js+'\')">🔊</button>'+
+      '<button type="button" class="au-btn au-ico" title="降噪清晰播放" onclick="playClearAudio(\''+js+'\')">✨</button>';
+  }
+  if(r && r._uploadErr) return '<span style="color:#c00;font-size:11px">上传失败</span>';
+  if(r && r.audio === "") return '<span class="muted">上传中…</span>';
+  return '<span class="muted">—</span>';
 }
 
 async function delLog(ts){
@@ -935,24 +951,21 @@ async function delLog(ts){
   try{ await fetch("/api/log/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({timeTs:String(ts)})}); }
   catch(e){ console.warn("删除后端日志失败", e); }
   logArr = logArr.filter(function(x){ return x.timeTs !== ts; });
-  try{ deleteMedia(ts); }catch(e){}
   saveLog(); renderLog();
   toast("已删除该条日志");
 }
 
 async function exportHtmlReport(){
   if(!logArr.length){ toast("暂无日志可导出"); return; }
-  // 从 IndexedDB 取回全部音频媒体
-  var mediaMap={};
-  try{ (await getAllMedia()).forEach(function(m){ mediaMap[m.timeTs]=m; }); }catch(e){}
+  // 音频直接引用服务器 audio 目录（不内嵌 base64），报告体积小、不占浏览器内存
   var reportTitle="传感器噪声监测报告 "+new Date().toLocaleString();
   var rows="";
   for(var i=0;i<logArr.length;i++){
     var rec=logArr[i];
-    var media=mediaMap[rec.timeTs]||{};
-    var audioData=validAudio(media.audioData) ? media.audioData : null;
-    var audioHtml = audioData
-      ? `<audio controls preload="none" style="height:28px;max-width:240px;"><source src="${audioData}" type="audio/webm">不支持播放</audio><br><button class="au-ico" title="5倍音量播放" onclick="const s=this.parentElement.querySelector('source');if(s)playBoostAudio(s.src);">🔊</button><button class="au-ico" title="降噪清晰播放" onclick="const s=this.parentElement.querySelector('source');if(s)playClearAudio(s.src);">✨</button>`
+    var au = (rec.audio && /^(\/|https?:)/.test(rec.audio)) ? rec.audio : "";
+    if(au && au.charAt(0)==="/") au = (location.origin||"") + au;   // 导出文件可能在别处打开，补全绝对地址
+    var audioHtml = au
+      ? `<audio controls preload="none" style="height:28px;max-width:240px;" src="${au}">不支持播放</audio><br><button class="au-ico" title="5倍音量播放" onclick="playBoostAudio('${au}')">🔊</button><button class="au-ico" title="降噪清晰播放" onclick="playClearAudio('${au}')">✨</button>`
       : '<span style="color:#888">无录音片段</span>';
     var locTip = rec.address ? (rec.address+"（"+rec.lat+", "+rec.lon+"）") : ((rec.lat!=null?rec.lat:"--")+", "+(rec.lon!=null?rec.lon:"--"));
     rows += `<tr style="border-bottom:#ccc 1px solid;">
@@ -998,7 +1011,7 @@ var playBoostAudio = ${playBoostAudio.toString()};
 $("btnStart").addEventListener("click", async function(){
   if(running){ await stopMonitor(); toast("监测与录像已停止"); } else await startMonitor();
 });
-$("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(); clearMedia(); saveLog(); renderLog(); toast("日志已清空"); });
+$("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(); saveLog(); renderLog(); toast("日志已清空"); });
 $("btnExport").addEventListener("click", exportHtmlReport);
 
 // 波形图 x 轴悬停：鼠标移动时显示该位置对应的年月日 时分秒 与分贝值
