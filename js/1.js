@@ -415,7 +415,7 @@ const TRIG_OFFSET = 6;
 const RELEASE_OFFSET = 3;   // 结束线 = 背景 + 3dB（低于触发线 6dB），噪声真正回落到常态附近才停
 const RELEASE_HYSTERESIS = 5;   // 白天/夜间结束线比触发线低 5dB（滞回）：常态噪声在阈值附近波动也能正常结束
 const HOLD_AFTER_FALL = 0.4;
-const MAX_SESSION_SEC = 120;   // 连续噪声记录上限：最多 2 分钟一段，超时切段重记
+const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 2 分钟一段，超时切段重记
 
 function setThr(){
   var h = new Date().getHours();
