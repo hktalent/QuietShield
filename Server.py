@@ -12,6 +12,7 @@ import glob
 import subprocess
 import base64
 import zipfile
+import shutil
 import user_agents  # 解析 User-Agent → 可读的设备/系统（如 iOS 12.0 iPhone）
 import threading
 from datetime import datetime
@@ -338,7 +339,8 @@ def _audio_ext(mime):
 
 def save_record_audio(name, data_url, mime):
     """dataURL 录音 → logs/audio/<年月日时分秒>.<后缀> 独立文件，返回播放 URL（失败返回空串）。
-    日志库只存该 URL，页面按页加载时再按需取音频。"""
+    日志库只存该 URL，页面按页加载时再按需取音频。
+    设置项 audioBoost5x 开启时，落盘后用放大 5 倍的版本直接覆盖原文件。"""
     if not data_url or not data_url.startswith("data:"):
         return ""
     try:
@@ -355,8 +357,13 @@ def save_record_audio(name, data_url, mime):
         while os.path.exists(os.path.join(AUDIO_DIR, fname)):  # 同一秒多条时加序号
             n += 1
             fname = f"{base}_{n}.{ext}"
-        with open(os.path.join(AUDIO_DIR, fname), "wb") as f:
+        path = os.path.join(AUDIO_DIR, fname)
+        with open(path, "wb") as f:
             f.write(raw)
+    # 放大音量：直接覆盖刚保存的版本（不另存副本）；失败则保留原文件
+    if load_settings().get("audioBoost5x"):
+        if not amplify_audio_inplace(path):
+            print(f"[音频] 放大失败，保留原文件: {fname}")
     return f"/audio/{fname}"
 
 
@@ -369,6 +376,93 @@ def audio_path_from_url(url):
     if os.path.commonpath([base, path]) != base or not os.path.isfile(path):
         return None
     return path
+
+
+# ---------------- 运行设置（持久化到 logs/settings.json） ----------------
+SETTINGS_FILE = os.path.join(LOG_DIR, "settings.json")
+DEFAULT_SETTINGS = {"audioBoost5x": True}
+
+
+def load_settings():
+    """读取运行设置；文件缺失/损坏时返回默认值（录音保存默认放大 5 倍）"""
+    data = {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    merged = dict(DEFAULT_SETTINGS)
+    if isinstance(data, dict) and isinstance(data.get("audioBoost5x"), bool):
+        merged["audioBoost5x"] = data["audioBoost5x"]
+    return merged
+
+
+def save_settings(patch):
+    """保存设置（只接受已知键），返回保存后的完整设置"""
+    with _io_lock:
+        settings = load_settings()
+        if isinstance(patch, dict):
+            for key in DEFAULT_SETTINGS:
+                if key in patch:
+                    settings[key] = bool(patch[key])
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+    return settings
+
+
+# ---------------- 录音放大（ffmpeg 就地覆盖） ----------------
+AUDIO_BOOST_GAIN = 5            # 放大倍数
+AUDIO_BOOST_LIMIT = 0.95        # 峰值限幅，避免放大后削波失真
+FFMPEG_BIN = shutil.which("ffmpeg") or next(
+    (p for p in ("/Users/51pwn/anaconda3/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg",
+                 "/usr/local/bin/ffmpeg") if os.path.isfile(p)), "")
+
+# 后缀 → (编码器, 码率)；wav 直接重采样为 PCM，无损
+_BOOST_CODECS = {
+    "webm": ("libopus", "96k"),
+    "ogg": ("libopus", "96k"),
+    "m4a": ("aac", "128k"),
+    "mp3": ("libmp3lame", "128k"),
+    "wav": ("pcm_s16le", ""),
+}
+
+
+def amplify_audio_inplace(path):
+    """用 ffmpeg 把录音放大 5 倍并峰值限幅后原子替换原文件。
+    未安装 ffmpeg、格式不支持或转码失败时返回 False，原文件保持不变。"""
+    ext = str(path).rsplit(".", 1)[-1].lower()
+    codec = _BOOST_CODECS.get(ext)
+    if not FFMPEG_BIN or not codec:
+        return False
+    tmp = f"{path}.boost.{ext}"
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", path, "-vn",
+           "-af", f"volume={AUDIO_BOOST_GAIN},alimiter=limit={AUDIO_BOOST_LIMIT}",
+           "-c:a", codec[0]]
+    if codec[1]:
+        cmd += ["-b:a", codec[1]]
+    cmd.append(tmp)
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 200:
+            with _io_lock:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return False
+        with _io_lock:
+            os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"[音频] 放大异常: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 
 # ---------------- 日志库（SQLite） ----------------
@@ -1886,6 +1980,26 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({"ok": True, "removed": removed}).encode("utf-8"))
 
+    def _send_json(self, obj, code=200):
+        self.send_response(code)
+        self._set_cors()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _handle_config_get(self):
+        self._send_json({"ok": True, **load_settings()})
+
+    def _handle_config_set(self):
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+        settings = save_settings(payload if isinstance(payload, dict) else {})
+        self._send_json({"ok": True, **settings})
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -1972,6 +2086,9 @@ class MyHandler(SimpleHTTPRequestHandler):
         if path == "/api/log/zip":
             self._handle_log_zip(parsed)
             return
+        if path == "/api/config":
+            self._handle_config_get()
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -1989,6 +2106,9 @@ class MyHandler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/log/del":
                 self._handle_log_delete(parsed)
+                return
+            if path == "/api/config":
+                self._handle_config_set()
                 return
             super().do_POST()
         except Exception as e:

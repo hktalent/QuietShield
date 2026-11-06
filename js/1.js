@@ -1092,6 +1092,33 @@ function applyMem(){
   else getDeviceFingerprint().then(applyMem);
 })();
 
+// 录音保存音量×5：服务端开关（所有设备共用），保存时直接覆盖为放大后的版本
+(function(){
+  var cb=$("boostCb");
+  if(!cb) return;
+  fetch("/api/config",{cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if(d && d.ok && typeof d.audioBoost5x==="boolean") cb.checked=d.audioBoost5x; })
+    .catch(function(){});   // 读不到就保持页面默认（开启）
+  cb.addEventListener("change", function(){
+    var want=cb.checked;
+    cb.disabled=true;
+    fetch("/api/config",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({audioBoost5x:want})
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d || !d.ok) throw new Error((d && d.err) || "保存失败");
+      cb.checked=!!d.audioBoost5x;
+      toast(cb.checked ? "录音保存音量×5 已开启" : "录音保存恢复原音量");
+    })
+    .catch(function(e){ cb.checked=!want; toast("⚠️设置保存失败："+e.message); })
+    .then(function(){ cb.disabled=false; });
+  });
+})();
+
 // 初始化：计算设备指纹、绘制空表
 getDeviceFingerprint().then(function(id){
   deviceId=id;
