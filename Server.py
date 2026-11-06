@@ -172,16 +172,50 @@ def safe_token(s, fallback="unknown"):
     return s[:128]
 
 
-def get_daily_log_filename():
-    """获取当日噪声日志文件名 noise_log_YYYY-MM-DD.html"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(LOG_DIR, f"noise_log_{today}.html")
+# 凌晨时段后缀：文件名与解析共用同一常量，避免两处写法不一致
+EARLY_SUFFIX = "_凌晨0100-0600"
 
 
-def get_early_morning_log_filename():
-    """凌晨(01:00~06:00)单独日志文件，文件名含时段起止(0100-0600)"""
+def log_stem(date, tag="", early=False):
+    """日志 HTML 名称（不含 .html）：noise_log_日期[_标签][_凌晨0100-0600]
+    每个标签每天一个独立 HTML；记录仍共用同一个数据库/数据文件，
+    页面按标签过滤显示与分页。"""
+    name = f"noise_log_{date}"
+    tag = safe_token(tag, fallback="") if tag else ""
+    if tag:
+        name += f"_{tag}"
+    if early:
+        name += EARLY_SUFFIX
+    return name
+
+
+def parse_log_stem(stem):
+    """noise_log_日期[_标签][_凌晨0100-0600] → (日期, 标签, 是否凌晨)
+    无法解析返回 None。旧文件（无标签段）标签返回空串，即不过滤。"""
+    m = re.match(r"^noise_log_(\d{4}-\d{2}-\d{2})(?:_(.+))?$", str(stem or ""))
+    if not m:
+        return None
+    date, tag = m.group(1), m.group(2) or ""
+    # 旧文件无标签段时后缀是 "凌晨0100-0600"（没有前导下划线），新文件是 "_凌晨0100-0600"
+    if tag == EARLY_SUFFIX.lstrip("_"):
+        tag, early = "", True
+    elif tag.endswith(EARLY_SUFFIX):
+        tag, early = tag[:-len(EARLY_SUFFIX)], True
+    else:
+        early = False
+    return date, tag, early
+
+
+def get_daily_log_filename(tag=""):
+    """获取当日某标签的日志文件名 noise_log_YYYY-MM-DD[_标签].html"""
     today = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(LOG_DIR, f"noise_log_{today}_凌晨0100-0600.html")
+    return os.path.join(LOG_DIR, log_stem(today, tag) + ".html")
+
+
+def get_early_morning_log_filename(tag=""):
+    """凌晨(01:00~06:00)单独日志文件，按标签分离，文件名含时段起止(0100-0600)"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(LOG_DIR, log_stem(today, tag, True) + ".html")
 
 
 def extract_mime_from_dataurl(dataurl):
@@ -198,6 +232,8 @@ LOC_PENDING = "—"
 
 # 分页外壳标记：写在文件开头 300 字节内，用于区分「外壳」与旧版整文件日志
 SHELL_MARK = 'name="qs-shell"'
+# 静态资源版本号：写进日志页 URL，强制浏览器取最新 CSS/JS（避免旧脚本不带标签过滤参数）
+ASSET_VER = "20261106d"
 
 
 PAGE_SIZE = 20  # 每页最多显示条数
@@ -219,12 +255,12 @@ LOG_SHELL = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="qs-shell" content="paged">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>噪声监测服务端日志 {boot_time}</title>
-<link href=../css/1.css rel=stylesheet>
+<title>噪声监测服务端日志 {tag_label}{early_tag} {boot_time}</title>
+<link href="../css/1.css?v={asset_ver}" rel=stylesheet>
 <script src="../js/player.js"></script>
 </head>
 <body>
-<h2>噪声监测日志{early_tag}</h2>
+<h2>噪声监测日志{tag_label}{early_tag}</h2>
 <p>《噪声污染防治法》扰民噪声：白天(>=6点 &lt;22点) &gt; 55 dB(A)；夜间 &gt; 45 dB(A)；录像由 /review.html 回看。日志创建时间：{boot_time}</p>
 <p id="locLine" class="loc-bar">📍 位置：{loc_line}</p>
 <div class="exp-bar">
@@ -251,7 +287,7 @@ LOG_SHELL = """<!DOCTYPE html>
 </table>
 <div class="pgbar" id="pgbar2"></div>
 <script>window.__LOG_CFG__={cfg};</script>
-<script src="../js/logview.js"></script>
+<script src="../js/logview.js?v={asset_ver}"></script>
 </body>
 </html>
 """
@@ -484,6 +520,22 @@ def _row_to_record(row):
     }
 
 
+def list_tags_for_date(date, early=False):
+    """某天出现过的标签（去重升序），供旧日志迁移后按标签建独立日志页"""
+    init_db()
+    where = "date=?"
+    if early:
+        where += " AND hour>=1 AND hour<6"
+    with _db_lock:
+        con = _db_conn()
+        try:
+            rows = con.execute(
+                f"SELECT DISTINCT tag FROM records WHERE {where} ORDER BY tag", (date,)).fetchall()
+        finally:
+            con.close()
+    return [r["tag"] or "" for r in rows]
+
+
 _SORT_SQL = {
     "time": "ts ASC",
     "time_desc": "ts DESC",
@@ -492,12 +544,23 @@ _SORT_SQL = {
 }
 
 
-def query_log_page(date, page=0, size=PAGE_SIZE, sort="time", early=False):
-    """按日期取一页（sort: time / time_desc / peak_desc / peak_asc）"""
-    init_db()
-    where = "date=?"
+def _log_where(date, early=False, tag=""):
+    """日志查询条件：日期 + 可选凌晨时段 + 可选标签（标签为空表示不过滤）。
+    返回 (where 子句, 参数列表)，供分页/导出/打包共用。"""
+    where, args = "date=?", [date]
     if early:
         where += " AND hour>=1 AND hour<6"
+    tag = str(tag or "")
+    if tag:
+        where += " AND tag=?"
+        args.append(tag)
+    return where, args
+
+
+def query_log_page(date, page=0, size=PAGE_SIZE, sort="time", early=False, tag=""):
+    """按日期取一页（sort: time / time_desc / peak_desc / peak_asc）"""
+    init_db()
+    where, args = _log_where(date, early, tag)
     order = _SORT_SQL.get(sort, _SORT_SQL["time"])
     try:
         page = max(0, int(page))
@@ -507,41 +570,43 @@ def query_log_page(date, page=0, size=PAGE_SIZE, sort="time", early=False):
     with _db_lock:
         con = _db_conn()
         try:
-            total = con.execute(f"SELECT COUNT(*) FROM records WHERE {where}", (date,)).fetchone()[0]
+            total = con.execute(f"SELECT COUNT(*) FROM records WHERE {where}", args).fetchone()[0]
             rows = con.execute(
                 f"SELECT * FROM records WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
-                (date, size, page * size)).fetchall()
+                args + [size, page * size]).fetchall()
         finally:
             con.close()
-    return {"date": date, "page": page, "size": size, "total": total,
+    return {"date": date, "tag": tag, "page": page, "size": size, "total": total,
             "rows": [_row_to_record(r) for r in rows]}
 
 
-def query_log_range(start, end):
+def query_log_range(start, end, tag=""):
     """按日期范围（含首尾）取全部记录，供导出证据包"""
     init_db()
+    where, args = "date>=? AND date<=?", [start, end]
+    tag = str(tag or "")
+    if tag:
+        where += " AND tag=?"
+        args.append(tag)
     with _db_lock:
         con = _db_conn()
         try:
             rows = con.execute(
-                "SELECT * FROM records WHERE date>=? AND date<=? ORDER BY ts ASC",
-                (start, end)).fetchall()
+                f"SELECT * FROM records WHERE {where} ORDER BY ts ASC", args).fetchall()
         finally:
             con.close()
     return [_row_to_record(r) for r in rows]
 
 
-def query_log_all(date, early=False):
-    """取某一天（可只取凌晨时段）的全部记录，按时间升序 —— 离线 ZIP 打包用"""
+def query_log_all(date, early=False, tag=""):
+    """取某一天（可只取凌晨时段、可只取某标签）的全部记录，按时间升序 —— 离线 ZIP 打包用"""
     init_db()
-    where = "date=?"
-    if early:
-        where += " AND hour>=1 AND hour<6"
+    where, args = _log_where(date, early, tag)
     with _db_lock:
         con = _db_conn()
         try:
             rows = con.execute(
-                f"SELECT * FROM records WHERE {where} ORDER BY ts ASC", (date,)).fetchall()
+                f"SELECT * FROM records WHERE {where} ORDER BY ts ASC", args).fetchall()
         finally:
             con.close()
     return [_row_to_record(r) for r in rows]
@@ -563,17 +628,16 @@ def exportable_records(recs):
     return out
 
 
-def query_export_count(date, early=False):
+def query_export_count(date, early=False, tag=""):
     """某天可导出的记录数（有录音且峰值 > 0），供导出界面显示"""
     init_db()
-    where = "date=? AND audio<>'' AND peak IS NOT NULL AND peak>0"
-    if early:
-        where += " AND hour>=1 AND hour<6"
+    where, args = _log_where(date, early, tag)
+    where += " AND audio<>'' AND peak IS NOT NULL AND peak>0"
     with _db_lock:
         con = _db_conn()
         try:
             return con.execute(
-                f"SELECT COUNT(*) FROM records WHERE {where}", (date,)).fetchone()[0]
+                f"SELECT COUNT(*) FROM records WHERE {where}", args).fetchone()[0]
         finally:
             con.close()
 
@@ -606,9 +670,11 @@ def _player_js_source():
         return ""
 
 
-def build_evidence_html(start, end):
-    """生成可离线打开的静态证据日志（音频内嵌 dataURL，无服务器也能播放）"""
-    recs = query_log_range(start, end)
+def build_evidence_html(start, end, tag=""):
+    """生成可离线打开的静态证据日志（音频内嵌 dataURL，无服务器也能播放）。
+    传入标签时只导出该标签的记录（与标签日志页一致）。"""
+    tag = str(tag or "")
+    recs = query_log_range(start, end, tag)
     peaks = [_to_float(r.get("peak")) for r in recs] or [0.0]
     audios = []
     rows = []
@@ -643,7 +709,7 @@ def build_evidence_html(start, end):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>噪声监测证据日志 {start} ~ {end}</title>
+<title>噪声监测证据日志 {start} ~ {end}{(' · ' + html.escape(tag)) if tag else ''}</title>
 <style>
 body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:20px;color:#222;background:#fff}}
 h1{{font-size:20px;margin:0 0 8px}}
@@ -659,9 +725,9 @@ tr:nth-child(even) td{{background:#fafbfd}}
 </style>
 </head>
 <body>
-<h1>噪声监测证据日志</h1>
+<h1>噪声监测证据日志{('（标签：' + html.escape(tag) + '）') if tag else ''}</h1>
 <div class="meta">
-区间：{html.escape(start)} ~ {html.escape(end)}　记录数：{len(recs)}　最高峰值：{max(peaks):.1f} dB<br>
+区间：{html.escape(start)} ~ {html.escape(end)}{('　标签：' + html.escape(tag)) if tag else ''}　记录数：{len(recs)}　最高峰值：{max(peaks):.1f} dB<br>
 判定参考：《噪声污染防治法》白天(≥6点 &lt;22点) &gt; 55 dB(A)；夜间 &gt; 45 dB(A)<br>
 生成时间：{gen}　生成工具：QuietShield
 </div>
@@ -731,10 +797,15 @@ def build_offline_log_html(meta):
     因此 file:// 直接双击也能分页；录音用相对路径 audio/xxx 播放。"""
     date = html.escape(str(meta.get("date") or ""))
     early = bool(meta.get("early"))
-    title = f"噪声监测日志 {date}" + ("（凌晨 01:00-06:00）" if early else "")
+    tag = str(meta.get("tag") or "")
+    tag_html = html.escape(tag)
+    title = (f"噪声监测日志 {date}" +
+             (f"（标签：{tag}）" if tag else "") +
+             ("（凌晨 01:00-06:00）" if early else ""))
     loc = html.escape(str(meta.get("location") or "—"))
     count = int(meta.get("count") or 0)
     exported = html.escape(str(meta.get("exported_at") or ""))
+    tag_line = f"　<b>标签：</b>{tag_html}" if tag else ""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -746,7 +817,7 @@ def build_offline_log_html(meta):
 <body>
 <h1>{html.escape(title)}</h1>
 <div class="meta">
-<b>日期：</b>{date}　<b>记录数：</b><span id="mTotal">{count}</span>　<b>位置：</b>{loc}<br>
+<b>日期：</b>{date}{tag_line}　<b>记录数：</b><span id="mTotal">{count}</span>　<b>位置：</b>{loc}<br>
 判定参考：《噪声污染防治法》扰民噪声：白天(≥6点 &lt;22点) &gt; 55 dB(A)；夜间 &gt; 45 dB(A)<br>
 <b>导出时间：</b>{exported}
 </div>
@@ -772,23 +843,24 @@ def build_offline_log_html(meta):
 
 def build_offline_log_zip(stem):
     """按日志名（不含 .html）打包离线证据 ZIP：html + js + json + 音频。
+    日志名形如 noise_log_日期[_标签][_凌晨0100-0600]，打包只含该标签的记录。
     返回 (zip 路径, 记录数, 音频文件数)；名称非法或日期解析失败返回 None。"""
     stem = str(stem or "").strip()
     if not re.fullmatch(r"noise_log_[^/\\]+", stem) or ".." in stem:
         return None
-    m = re.match(r"noise_log_(\d{4}-\d{2}-\d{2})", stem)
-    if not m:
+    parsed = parse_log_stem(stem)
+    if not parsed:
         return None
-    date = m.group(1)
-    early = "凌晨" in stem
-    # 证据包只保留有录音且峰值 > 0 的记录
-    recs = exportable_records(query_log_all(date, early))
+    date, tag, early = parsed
+    # 证据包只保留有录音且峰值 > 0 的记录（按标签过滤）
+    recs = exportable_records(query_log_all(date, early, tag))
     meta = {
         "name": stem,
         "date": date,
+        "tag": tag,
         "early": early,
         "count": len(recs),
-        "location": latest_location_line(date),
+        "location": latest_location_line(date, tag),
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     # 只打包本日志实际引用的音频，避免把整个 audio 目录塞进证据包；
@@ -808,7 +880,7 @@ def build_offline_log_zip(stem):
                json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c") + ";\n")
     data_json = json.dumps(payload, ensure_ascii=False, indent=1)
     os.makedirs(EXPORT_DIR, exist_ok=True)
-    zip_name = f"noise_log_{date}{'_early' if early else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_name = f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     zip_path = os.path.join(EXPORT_DIR, zip_name)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("index.html", build_offline_log_html(meta))
@@ -822,7 +894,8 @@ def build_offline_log_zip(stem):
 
 
 def list_log_html_stems():
-    """logs/ 下所有日志 HTML 的名称（去掉 .html），按日期倒序"""
+    """logs/ 下所有日志 HTML 的名称（去掉 .html），按日期倒序、标签升序。
+    每个条目带 date/tag/early/count，供导出界面按日期与标签分组显示。"""
     try:
         names = sorted(os.listdir(LOG_DIR))
     except OSError:
@@ -835,15 +908,17 @@ def list_log_html_stems():
         if not os.path.isfile(full):
             continue
         stem = fn[:-5]
-        m = re.match(r"noise_log_(\d{4}-\d{2}-\d{2})", stem)
-        date = m.group(1) if m else ""
-        early = "凌晨" in stem
+        parsed = parse_log_stem(stem)
+        if not parsed:
+            continue
+        date, tag, early = parsed
         try:
-            count = query_export_count(date, early) if date else 0
+            count = query_export_count(date, early, tag)
         except Exception:
             count = 0
-        items.append({"name": stem, "date": date, "early": early, "count": count})
-    items.sort(key=lambda x: (x["date"], x["early"], x["name"]), reverse=True)
+        items.append({"name": stem, "date": date, "tag": tag, "early": early, "count": count})
+    items.sort(key=lambda x: (x["tag"], x["early"], x["name"]))
+    items.sort(key=lambda x: x["date"], reverse=True)
     return items
 
 
@@ -868,14 +943,19 @@ def delete_log_record(ts):
     return removed
 
 
-def latest_location_line(date=None):
+def latest_location_line(date=None, tag=""):
     """最近一条带定位记录的抬头位置文案；没有则返回空串。
-    日志页抬头不再固定写“未上报”，而是从数据库回填真实地址。"""
+    日志页抬头不再固定写“未上报”，而是从数据库回填真实地址。
+    传入标签时只取该标签的记录，保证每个标签日志页的位置互不串台。"""
     init_db()
     where, args = "loc_title<>''", []
     if date:
         where += " AND date=?"
         args.append(date)
+    tag = str(tag or "")
+    if tag:
+        where += " AND tag=?"
+        args.append(tag)
     try:
         with _db_lock:
             con = _db_conn()
@@ -1010,28 +1090,103 @@ def refresh_shell_locations():
                 head = f.read(300)
             if SHELL_MARK not in head:
                 continue
-            m = re.search(r"(noise_log_\d{4}-\d{2}-\d{2})", fn)
-            date = m.group(1)[len("noise_log_"):] if m else None
-            set_log_location_text(path, latest_location_line(date))
+            parsed = parse_log_stem(fn[:-5])
+            if not parsed:
+                continue
+            date, tag, _early = parsed
+            set_log_location_text(path, latest_location_line(date, tag))
         except Exception as e:
             print(f"[位置回填失败] {fn}: {e}")
 
 
-def write_log_shell_file(log_file_path, date, early=False, loc_line=None):
-    """写日志外壳（含创建时间与位置抬头）。记录不写在这里，由页面按页从数据库加载"""
+def write_log_shell_file(log_file_path, date, early=False, loc_line=None, tag=""):
+    """写日志外壳（含创建时间、标签与位置抬头）。记录不写在这里，由页面按页从数据库加载"""
     boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tag = str(tag or "")
     if not loc_line:
-        loc_line = latest_location_line(date)
+        loc_line = latest_location_line(date, tag)
     loc = html.escape(loc_line or LOC_PENDING)
-    cfg = json.dumps({"date": date, "early": bool(early)})
+    tag_label = f"（标签：{html.escape(tag)}）" if tag else ""
+    cfg = json.dumps({"date": date, "early": bool(early), "tag": tag}, ensure_ascii=False)
     text = (LOG_SHELL
             .replace("{boot_time}", boot_time)
             .replace("{loc_line}", loc)
+            .replace("{tag_label}", tag_label)
             .replace("{early_tag}", "（凌晨 01:00-06:00）" if early else "")
+            .replace("{asset_ver}", ASSET_VER)
             .replace("{cfg}", cfg))
     with _io_lock:
         with open(log_file_path, "w", encoding="utf-8") as f:
             f.write(text)
+
+
+def ensure_tag_shells(date):
+    """确保某天每个标签都有独立日志页（日常 + 凌晨），已存在的不覆盖。返回新建数量"""
+    created = 0
+    for tag in list_tags_for_date(date):
+        path = os.path.join(LOG_DIR, log_stem(date, tag) + ".html")
+        if not os.path.exists(path):
+            write_log_shell_file(path, date, False, None, tag)
+            created += 1
+    for tag in list_tags_for_date(date, early=True):
+        path = os.path.join(LOG_DIR, log_stem(date, tag, True) + ".html")
+        if not os.path.exists(path):
+            write_log_shell_file(path, date, True, None, tag)
+            created += 1
+    return created
+
+
+def refresh_tag_shells():
+    """启动时为数据库里已有的日期补齐按标签分离的日志页（旧数据也能按标签查看/导出）"""
+    init_db()
+    try:
+        with _db_lock:
+            con = _db_conn()
+            try:
+                dates = [r[0] for r in con.execute(
+                    "SELECT DISTINCT date FROM records ORDER BY date").fetchall()]
+            finally:
+                con.close()
+    except Exception as e:
+        print(f"[标签日志] 读取日期失败: {e}")
+        return
+    total = 0
+    for date in dates:
+        total += ensure_tag_shells(date)
+    if total:
+        print(f"[标签日志] 已按标签补齐 {total} 个日志页")
+
+
+def refresh_shell_assets():
+    """把已有日志页里的 CSS/JS 引用升级为带版本号的 URL。
+    日志页数据由 logview.js 按标签请求，若浏览器沿用旧脚本（不带 tag 参数），
+    标签页会错误显示其他标签的记录；版本号可强制浏览器重新加载。"""
+    changed = 0
+    try:
+        names = [n for n in os.listdir(LOG_DIR)
+                 if n.startswith("noise_log_") and n.endswith(".html")]
+    except OSError:
+        return
+    for fn in names:
+        path = os.path.join(LOG_DIR, fn)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if SHELL_MARK not in text[:300]:
+            continue
+        new = re.sub(r"\.\./css/1\.css(?:\?v=[^\"'\s>]*)?",
+                     f"../css/1.css?v={ASSET_VER}", text)
+        new = re.sub(r"\.\./js/logview\.js(?:\?v=[^\"'\s>]*)?",
+                     f"../js/logview.js?v={ASSET_VER}", new)
+        if new != text:
+            with _io_lock:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new)
+            changed += 1
+    if changed:
+        print(f"[日志页] 已升级 {changed} 个页面的 CSS/JS 版本号")
 
 
 def _legacy_row_to_record(ts, inner, date):
@@ -1131,9 +1286,8 @@ def _migrate_one(src, date):
     print(f"[迁移开始] {os.path.basename(src)} → SQLite …")
     try:
         n = migrate_legacy_log_file(src, date)
-        shell = os.path.join(LOG_DIR, f"noise_log_{date}.html")
-        if not os.path.exists(shell):
-            write_log_shell_file(shell, date)
+        # 旧日志入库后按标签补齐独立日志页（每个标签每天一个；凌晨单独一份）
+        ensure_tag_shells(date)
         mark_file_migrated(os.path.basename(src))
         print(f"[迁移完成] {os.path.basename(src)}：{n} 条")
         return True
@@ -1288,6 +1442,13 @@ def migrate_json_pages_to_db():
 
 
 class MyHandler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        # 页面/样式/脚本每次向服务端校验，避免改了 CSS 后浏览器还显示旧样式（默认链接变紫）
+        path = urlparse(self.path).path
+        if path.endswith((".html", ".css", ".js")) and not path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache, must-revalidate")
+        super().end_headers()
+
     def _set_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST,GET,OPTIONS")
@@ -1298,14 +1459,14 @@ class MyHandler(SimpleHTTPRequestHandler):
         self._set_cors()
         self.end_headers()
 
-    def _write_log_shell(self, log_file_path, date, early=False, loc_line=None):
-        write_log_shell_file(log_file_path, date, early, loc_line)
+    def _write_log_shell(self, log_file_path, date, early=False, loc_line=None, tag=""):
+        write_log_shell_file(log_file_path, date, early, loc_line, tag)
 
-    def _ensure_log_shell(self, log_file_path, date, early=False, loc_line=None):
+    def _ensure_log_shell(self, log_file_path, date, early=False, loc_line=None, tag=""):
         """确保日志页是分页外壳：不存在则创建；旧版（行直接写在 HTML 里）的文件
         交给后台迁移，绝不在请求里做整文件转换"""
         if not os.path.exists(log_file_path):
-            self._write_log_shell(log_file_path, date, early, loc_line)
+            self._write_log_shell(log_file_path, date, early, loc_line, tag)
             return
         try:
             with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1319,7 +1480,7 @@ class MyHandler(SimpleHTTPRequestHandler):
             return
         # 旧版文件：移到 _legacy 保留原件，后台迁移入库，再写外壳
         start_legacy_migration(log_file_path, date)
-        self._write_log_shell(log_file_path, date, early, loc_line)
+        self._write_log_shell(log_file_path, date, early, loc_line, tag)
 
     def _update_log_location(self, log_file_path, loc_line):
         """回填日志抬头的位置行：把占位符/旧坐标替换为解析后的地址"""
@@ -1485,7 +1646,8 @@ class MyHandler(SimpleHTTPRequestHandler):
             size = PAGE_SIZE
         sort = q.get("sort", ["time"])[0]
         early = q.get("early", ["0"])[0] in ("1", "true", "yes")
-        data = query_log_page(date, page, size, sort, early)
+        tag = q.get("tag", [""])[0]
+        data = query_log_page(date, page, size, sort, early, tag)
         self.send_response(200)
         self._set_cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1504,9 +1666,12 @@ class MyHandler(SimpleHTTPRequestHandler):
             return
         if start > end:
             start, end = end, start
-        doc, count = build_evidence_html(start, end)
+        tag = q.get("tag", [""])[0]
+        doc, count = build_evidence_html(start, end, tag)
         os.makedirs(EXPORT_DIR, exist_ok=True)
-        fname = f"noise_evidence_{start}_{end}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        tag_part = ("_" + safe_token(tag, fallback="")) if tag else ""
+        fname = (f"noise_evidence_{start}_{end}{tag_part}_"
+                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
         path = os.path.join(EXPORT_DIR, fname)
         with _io_lock:
             with open(path, "w", encoding="utf-8") as f:
@@ -1668,12 +1833,12 @@ class MyHandler(SimpleHTTPRequestHandler):
         }
         append_log_record(date, record)
 
-        # 日志页外壳（不存在则创建；旧格式自动迁移入库）
-        daily_path = get_daily_log_filename()
-        self._ensure_log_shell(daily_path, date, False, loc_line)
-        # 凌晨 01:00~06:00：额外的凌晨日志页（数据共用当天记录，页面按小时过滤）
+        # 日志页外壳：每个标签每天一个独立 HTML（记录仍共用数据库，页面按标签过滤）
+        daily_path = get_daily_log_filename(tag)
+        self._ensure_log_shell(daily_path, date, False, loc_line, tag)
+        # 凌晨 01:00~06:00：额外的凌晨日志页（同样按标签分离，页面按小时+标签过滤）
         if _is_early(record):
-            self._ensure_log_shell(get_early_morning_log_filename(), date, True, loc_line)
+            self._ensure_log_shell(get_early_morning_log_filename(tag), date, True, loc_line, tag)
 
         self.send_response(200)
         self._set_cors()
@@ -1891,9 +2056,11 @@ if __name__ == "__main__":
     normalize_audio_layout()    # 旧音频目录拍平为 logs/audio/年月日时分秒.后缀
     migrate_all_legacy_logs()   # 旧版日志（行写在 HTML 里）后台导入 SQLite
     backfill_locations_from_legacy()  # 旧页抬头里的历史定位地址回填数据库
+    refresh_tag_shells()        # 按标签补齐每天独立日志页（每个标签日常 + 凌晨）
+    refresh_shell_assets()      # 日志页 CSS/JS 加版本号，避免浏览器用旧脚本串标签
     refresh_shell_locations()   # 日志页抬头位置：从数据库回填（无定位显示 —）
     print(f'HTTPS server running on https://{ADDR[0]}:{ADDR[1]}（本机可访问 / 局域网可用）')
-    print(f"每日噪声日志：{LOG_DIR}/noise_log_YYYY-MM-DD.html；记录库：{DB_PATH}；每页 {PAGE_SIZE} 条")
+    print(f"每日噪声日志：{LOG_DIR}/noise_log_YYYY-MM-DD_<标签>.html（凌晨：…_<标签>_凌晨0100-0600.html）；记录库：{DB_PATH}；每页 {PAGE_SIZE} 条")
     print(f"录像存储目录：{VIDEO_DIR}/<设备指纹>/（webm 分片 + 合并的 10 分钟 MP4）")
     print("录像回看页：https://127.0.0.1:8088/review.html（优先播 MP4）")
     httpd.serve_forever()

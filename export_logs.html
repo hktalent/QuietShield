@@ -18,6 +18,8 @@ button.primary:hover{background:#1f5ed8}
 table{width:100%;border-collapse:collapse;font-size:14px;background:#fff;border:1px solid #e2e6ee;border-radius:8px;overflow:hidden}
 th,td{border-bottom:1px solid #eef1f6;padding:10px 12px;text-align:left;vertical-align:middle}
 th{background:#f4f6fa;font-weight:600}
+tr.grp-date td{background:#eaf1ff;color:#1f4fa8;font-weight:600;font-size:14px;padding:9px 12px}
+tr.grp-tag td{background:#f7f9fc;color:#41506b;font-weight:600;font-size:13px;padding:7px 12px}
 td .ops{display:flex;gap:8px;flex-wrap:wrap}
 td .ops a{font-size:13px;padding:6px 10px;border:1px solid #c8cfdb;border-radius:6px;text-decoration:none;color:#2f6fed;white-space:nowrap}
 td .ops a:hover{background:#eef4ff}
@@ -30,7 +32,8 @@ td .ops a:hover{background:#eef4ff}
 <body>
 <h1>导出日志（ZIP 离线证据包）</h1>
 <p class="note">
-下面的列表来自服务器 <b>logs/</b> 目录（名称已去掉 .html 后缀）。点击「导出 ZIP」会打包该日志的全部记录：
+下面的列表来自服务器 <b>logs/</b> 目录（名称已去掉 .html 后缀），已按 <b>日期 → 标签</b> 分组：
+每个标签每天一个独立日志（日常 / 凌晨 01:00-06:00 各一份）。点击「导出 ZIP」会打包该日志的全部记录：
 <b>index.html</b>（离线日志页，可分页、可播放）、<b>js/offline.js</b>、<b>data/log.js</b> / <b>data/log.json</b> 数据文件、以及该日志引用的 <b>audio/</b> 录音文件。<br>
 解压后<b>双击 index.html 即可离线浏览</b>，无需服务器或网络（录音通过相对路径播放）。
 </p>
@@ -40,11 +43,11 @@ td .ops a:hover{background:#eef4ff}
 </div>
 <table>
 <thead>
-<tr><th style="width:46%">日志名称（不含 .html）</th><th>日期</th><th>可导出记录</th><th style="width:30%">操作</th></tr>
+<tr><th style="width:12%">时段</th><th style="width:46%">日志名称（不含 .html）</th><th style="width:14%">可导出记录</th><th style="width:28%">操作</th></tr>
 </thead>
 <tbody id="listBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
 </table>
-<p class="foot">提示：导出文件保存在服务器 logs/exports/ 下；ZIP 内音频按本日志实际引用打包，不会包含无关录音。</p>
+<p class="foot">提示：导出文件保存在服务器 logs/exports/ 下；ZIP 内只包含该日志实际引用的音频，不会包含无关录音。</p>
 <script>
 (function () {
   var body = document.getElementById("listBody");
@@ -64,54 +67,97 @@ td .ops a:hover{background:#eef4ff}
       });
   }
 
+  function groupRow(text, cls) {
+    var tr = document.createElement("tr");
+    tr.className = cls;
+    var td = document.createElement("td");
+    td.colSpan = 4;
+    td.textContent = text;
+    tr.appendChild(td);
+    return tr;
+  }
+
+  function fileRow(f) {
+    var tr = document.createElement("tr");
+
+    var tdPeriod = document.createElement("td");
+    tdPeriod.textContent = f.early ? "凌晨 01:00-06:00" : "日常";
+    if (f.early) {
+      var et = document.createElement("span");
+      et.className = "tag early";
+      et.textContent = "凌晨";
+      tdPeriod.appendChild(et);
+    }
+    tr.appendChild(tdPeriod);
+
+    var tdName = document.createElement("td");
+    tdName.textContent = f.name;
+    tr.appendChild(tdName);
+
+    var tdCount = document.createElement("td");
+    tdCount.textContent = String(f.count == null ? 0 : f.count);
+    tr.appendChild(tdCount);
+
+    var tdOps = document.createElement("td");
+    var ops = document.createElement("div");
+    ops.className = "ops";
+
+    var open = document.createElement("a");
+    open.href = "/logs/" + encodeURIComponent(f.name) + ".html";
+    open.target = "_blank";
+    open.rel = "noopener";
+    open.textContent = "打开在线日志";
+    ops.appendChild(open);
+
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "primary";
+    btn.textContent = "导出 ZIP";
+    btn.onclick = function () { exportZip(f.name, btn); };
+    ops.appendChild(btn);
+
+    tdOps.appendChild(ops);
+    tr.appendChild(tdOps);
+    return tr;
+  }
+
   function render(files) {
     body.innerHTML = "";
     if (!files.length) {
       body.innerHTML = '<tr><td colspan="4" class="empty">logs/ 下暂无可导出的日志 HTML</td></tr>';
       return;
     }
+    // 按日期分组（接口已按日期倒序、标签升序返回）
+    var dates = [];
+    var byDate = {};
     files.forEach(function (f) {
-      var tr = document.createElement("tr");
+      var d = f.date || "--";
+      if (!byDate[d]) { byDate[d] = []; dates.push(d); }
+      byDate[d].push(f);
+    });
 
-      var td1 = document.createElement("td");
-      td1.textContent = f.name;
-      if (f.early) {
-        var t = document.createElement("span");
-        t.className = "tag early";
-        t.textContent = "凌晨";
-        td1.appendChild(t);
-      }
-      tr.appendChild(td1);
+    dates.forEach(function (date) {
+      var items = byDate[date];
+      // 同一日期内再按标签分组（标签为空的是历史未分标签日志）
+      var tags = [];
+      var byTag = {};
+      items.forEach(function (f) {
+        var t = f.tag || "";
+        if (!byTag[t]) { byTag[t] = []; tags.push(t); }
+        byTag[t].push(f);
+      });
 
-      var td2 = document.createElement("td");
-      td2.textContent = f.date || "--";
-      tr.appendChild(td2);
+      body.appendChild(groupRow(
+        "📅 " + date + " · " + tags.length + " 个标签 · " + items.length + " 个日志",
+        "grp-date"));
 
-      var td3 = document.createElement("td");
-      td3.textContent = String(f.count == null ? 0 : f.count);
-      tr.appendChild(td3);
-
-      var td4 = document.createElement("td");
-      var ops = document.createElement("div");
-      ops.className = "ops";
-
-      var open = document.createElement("a");
-      open.href = "/logs/" + encodeURIComponent(f.name) + ".html";
-      open.target = "_blank";
-      open.rel = "noopener";
-      open.textContent = "打开在线日志";
-      ops.appendChild(open);
-
-      var btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "primary";
-      btn.textContent = "导出 ZIP";
-      btn.onclick = function () { exportZip(f.name, btn); };
-      ops.appendChild(btn);
-
-      td4.appendChild(ops);
-      tr.appendChild(td4);
-      body.appendChild(tr);
+      tags.forEach(function (t) {
+        var tagItems = byTag[t];
+        body.appendChild(groupRow(
+          "🏷 " + (t || "（全部标签 · 历史日志）") + " · " + tagItems.length + " 个日志",
+          "grp-tag"));
+        tagItems.forEach(function (f) { body.appendChild(fileRow(f)); });
+      });
     });
   }
 

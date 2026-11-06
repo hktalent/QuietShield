@@ -16,15 +16,36 @@
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{background:var(--bg);color:var(--text);font-family:var(--sans);-webkit-text-size-adjust:100%}
 body{padding:0 0 48px}
+/* 统一链接配色：杜绝浏览器默认的蓝/紫链接 */
+a,a:visited{color:var(--cyan);text-decoration:none}
+a:hover{color:var(--text)}
 #wrap{max-width:720px;margin:0 auto;padding:0 14px}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;touch-action:manipulation}
 button:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
 /* ===== 顶栏 ===== */
-header{padding:14px 0 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:center;gap:10px}
+header{padding:14px 0 10px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 10px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
 .brand svg{flex:0 0 auto}
-.brand h1{font-size:15px;font-weight:700;letter-spacing:.5px;line-height:1.2}
-.brand .sub{font-size:11px;color:var(--muted);font-family:var(--mono)}
+.brand-txt{min-width:0}
+.brand h1{font-size:15px;font-weight:700;letter-spacing:.5px;line-height:1.25;white-space:nowrap}
+.brand h1 .h1-sub{font-size:10px;font-weight:600;letter-spacing:1px;color:var(--muted);margin-left:4px;padding:2px 7px;border:1px solid var(--line);border-radius:20px;background:var(--panel2);vertical-align:1px}
+.brand .sub{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 顶栏功能入口：胶囊按钮，各用主题色区分（视频=绿 / 回播=琥珀） */
+.nav{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto}
+.nav-link{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;letter-spacing:.3px;padding:6px 11px;border-radius:20px;text-decoration:none;white-space:nowrap;border:1px solid transparent;transition:background .18s,border-color .18s,box-shadow .18s,transform .1s}
+.nav-link .nav-dot{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 6px currentColor;opacity:.9}
+.nav-link:active{transform:translateY(1px)}
+.nav-video,.nav-video:visited{color:var(--green);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.10)}
+.nav-video:hover{color:#7DF3C3;background:rgba(52,211,153,.18);border-color:rgba(52,211,153,.75);box-shadow:0 0 12px rgba(52,211,153,.28);transform:translateY(-1px)}
+.nav-audio,.nav-audio:visited{color:var(--amber);border-color:rgba(245,166,35,.35);background:rgba(245,166,35,.10)}
+.nav-audio:hover{color:#FFC55C;background:rgba(245,166,35,.18);border-color:rgba(245,166,35,.75);box-shadow:0 0 12px rgba(245,166,35,.28);transform:translateY(-1px)}
+.nav-link:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+@media(max-width:380px){
+  .brand h1{font-size:14px;letter-spacing:.2px}
+  .brand h1 .h1-sub{font-size:9px;padding:1px 6px;margin-left:2px}
+  .nav{gap:6px}
+  .nav-link{padding:5px 9px;font-size:10px}
+}
 .pill{font-size:10px;font-family:var(--mono);padding:4px 8px;border-radius:20px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
 .pill.on{color:var(--green);border-color:rgba(52,211,153,.5);background:rgba(52,211,153,.08)}
 /* ===== 状态条 ===== */

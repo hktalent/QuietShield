@@ -3,6 +3,11 @@
 (function () {
   var D = window.__QS_LOG__ || { meta: {}, records: [] };
   var records = (D.records || []).slice();
+  // 数据文件可按天共用（含全部标签）；显示与分页按标签过滤，保证每个标签日志只看到自己的记录
+  var tag = (D.meta && D.meta.tag) || "";
+  if (tag) {
+    records = records.filter(function (r) { return (r.tag || "") === tag; });
+  }
   var S = { page: 0, size: 20, sort: "time" };
 
   function $(id) { return document.getElementById(id); }
@@ -172,6 +177,7 @@
       var info = document.createElement("span");
       info.className = "pg-info";
       info.textContent = "第 " + (S.page + 1) + "/" + n + " 页 · 共 " + total + " 条" +
+        (((D.meta || {}).tag) ? "（标签：" + D.meta.tag + "）" : "") +
         (meta.early ? "（仅凌晨记录）" : "");
       bar.appendChild(info);
     });

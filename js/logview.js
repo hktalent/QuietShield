@@ -2,8 +2,8 @@
  * 峰值列可排序（降序/升序），切换排序即重新查询第 1 页。
  * 支持选择起止日期导出离线证据 HTML（音频内嵌，无服务器也能播放）。 */
 (function () {
-  var cfg = window.__LOG_CFG__ || { date: "", early: false };
-  var S = { date: cfg.date, early: !!cfg.early, page: 0, size: 20, total: 0, sort: "time", rows: [] };
+  var cfg = window.__LOG_CFG__ || { date: "", early: false, tag: "" };
+  var S = { date: cfg.date, early: !!cfg.early, tag: cfg.tag || "", page: 0, size: 20, total: 0, sort: "time", rows: [] };
 
   function $(id) { return document.getElementById(id); }
 
@@ -22,10 +22,14 @@
     renderPager();
     var url = "/api/log/list?date=" + encodeURIComponent(S.date) +
       "&page=" + i + "&size=" + S.size + "&sort=" + S.sort +
-      (S.early ? "&early=1" : "");
+      (S.early ? "&early=1" : "") +
+      (S.tag ? "&tag=" + encodeURIComponent(S.tag) : "");
     fetchJSON(url).then(function (data) {
       S.total = data.total || 0;
-      S.rows = data.rows || [];
+      // 双保险：即使脚本被缓存/后端忽略 tag，也只显示当前标签的记录
+      S.rows = (data.rows || []).filter(function (r) {
+        return !S.tag || (r.tag || "") === S.tag;
+      });
       renderRows();
       renderPager();
     }).catch(function (e) {
@@ -139,6 +143,7 @@
       var info = document.createElement("span");
       info.className = "pg-info";
       info.textContent = "第 " + (S.page + 1) + "/" + n + " 页 · 共 " + S.total + " 条" +
+        (S.tag ? "（标签：" + S.tag + "）" : "") +
         (S.early ? "（仅凌晨记录）" : "");
       bar.appendChild(info);
     });
@@ -176,7 +181,8 @@
       if (!a || !b) { msg.textContent = "请选择开始和结束日期"; return; }
       msg.textContent = "生成中…";
       btn.disabled = true;
-      fetch("/api/log/export?start=" + encodeURIComponent(a) + "&end=" + encodeURIComponent(b), { cache: "no-store" })
+      fetch("/api/log/export?start=" + encodeURIComponent(a) + "&end=" + encodeURIComponent(b) +
+        (S.tag ? "&tag=" + encodeURIComponent(S.tag) : ""), { cache: "no-store" })
         .then(function (r) { return r.json(); })
         .then(function (d) {
           if (!d.ok) throw new Error(d.err || "导出失败");
