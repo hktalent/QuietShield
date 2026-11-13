@@ -3,5 +3,5 @@
 if [ ! -f "server.key" ] || [ ! -f "server.crt" ]; then
   openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
 fi
-# 启动 https 静态文件服务 0.0.0.0:8088
+# 启动 https 静态文件服务 0.0.0.0:8808
 /Users/51pwn/anaconda3/bin/python3 Server.py

@@ -207,15 +207,16 @@ def parse_log_stem(stem):
     return date, tag, early
 
 
-def get_daily_log_filename(tag=""):
-    """获取当日某标签的日志文件名 noise_log_YYYY-MM-DD[_标签].html"""
-    today = datetime.now().strftime("%Y-%m-%d")
+def get_daily_log_filename(tag="", date=None):
+    """获取某日某标签的日志文件名 noise_log_YYYY-MM-DD[_标签].html
+    date 传记录自身的日期时，跨零点上报的记录不会写错日志页。"""
+    today = date or datetime.now().strftime("%Y-%m-%d")
     return os.path.join(LOG_DIR, log_stem(today, tag) + ".html")
 
 
-def get_early_morning_log_filename(tag=""):
+def get_early_morning_log_filename(tag="", date=None):
     """凌晨(01:00~06:00)单独日志文件，按标签分离，文件名含时段起止(0100-0600)"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = date or datetime.now().strftime("%Y-%m-%d")
     return os.path.join(LOG_DIR, log_stem(today, tag, True) + ".html")
 
 
@@ -416,6 +417,9 @@ def save_settings(patch):
 # ---------------- 录音放大（ffmpeg 就地覆盖） ----------------
 AUDIO_BOOST_GAIN = 5            # 放大倍数
 AUDIO_BOOST_LIMIT = 0.95        # 峰值限幅，避免放大后削波失真
+# 单条录音 dataURL 上限：正常 60~90 秒 opus 约 1~2MB，留足余量；
+# 超过基本只可能是客户端样本缓冲失控（历史事故中出现过单条 62MB 的 webm）。
+MAX_AUDIO_DATAURL = 16 * 1024 * 1024
 FFMPEG_BIN = shutil.which("ffmpeg") or next(
     (p for p in ("/Users/51pwn/anaconda3/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg",
                  "/usr/local/bin/ffmpeg") if os.path.isfile(p)), "")
@@ -1537,13 +1541,27 @@ def migrate_json_pages_to_db():
 
 class MyHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
-        # 页面/样式/脚本每次向服务端校验，避免改了 CSS 后浏览器还显示旧样式（默认链接变紫）
+        # 页面/样式/脚本每次向服务端校验，避免改了 CSS/JS 后浏览器还显示旧版本。
+        # 注意：本类早期有两个 end_headers 定义，后一个会覆盖前一个，
+        # 导致这段 no-cache 逻辑实际从未生效（前端只能靠 ?v=xxx 手动过期）。
+        # 现已合并为唯一实现，任何版本的 HTML/CSS/JS 都会带 no-cache。
         path = urlparse(self.path).path
-        if path.endswith((".html", ".css", ".js")) and not path.startswith("/api/"):
-            self.send_header("Cache-Control", "no-cache, must-revalidate")
+        if path.endswith((".html", ".css", ".js", ".json")) and not path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+        self._set_cors()
         super().end_headers()
 
+    def send_response(self, *args, **kwargs):
+        # 每个响应开始前重置 CORS 已发送标记（end_headers 统一补 CORS，
+        # 各 handler 里既有的 self._set_cors() 调用则自动变成空操作，避免重复头发两份）
+        self._cors_sent = False
+        super().send_response(*args, **kwargs)
+
     def _set_cors(self):
+        if getattr(self, "_cors_sent", False):
+            return
+        self._cors_sent = True
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST,GET,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -1552,6 +1570,47 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self._set_cors()
         self.end_headers()
+
+    def _serve_file_range(self, fpath, ctype):
+        """按 RFC 7233 提供文件：支持 Range（206/416），始终分块写出不整体读入内存。
+        音频与视频共用，Safari 的 <audio>/<video> 拖动进度条依赖 206 分段响应。"""
+        size = os.path.getsize(fpath)
+        start, end = 0, size - 1
+        partial = False
+        rng = self.headers.get("Range") or ""
+        m = re.match(r"bytes=(\d*)-(\d*)", rng)
+        if m and size:
+            a, b = m.group(1), m.group(2)
+            if a:
+                start = int(a)
+                end = int(b) if b else size - 1
+            elif b:   # bytes=-N：最后 N 字节
+                start = max(0, size - int(b))
+            else:
+                start = 0
+            end = min(end, size - 1)
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            partial = True
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        with open(fpath, "rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = f.read(min(512 * 1024, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+                self.wfile.write(chunk)
 
     def _write_log_shell(self, log_file_path, date, early=False, loc_line=None, tag=""):
         write_log_shell_file(log_file_path, date, early, loc_line, tag)
@@ -1595,8 +1654,13 @@ class MyHandler(SimpleHTTPRequestHandler):
         except Exception:
             seg_index = 0
 
-        length = int(self.headers.get("Content-Length", 0))
-        data = self.rfile.read(length) if length > 0 else b""
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            self._send_json({"ok": False, "err": "empty body"}, 400)
+            return
+        if length > 200 * 1024 * 1024:      # 单个分片上限 200MB，防异常客户端撑爆磁盘
+            self._send_json({"ok": False, "err": "segment too large"}, 413)
+            return
 
         dev_dir = os.path.join(VIDEO_DIR, device_id)
         session_key = f"{tag}_{start}"
@@ -1605,8 +1669,36 @@ class MyHandler(SimpleHTTPRequestHandler):
 
         with _io_lock:
             os.makedirs(dev_dir, exist_ok=True)
-            with open(fpath, "wb") as f:
-                f.write(data)
+
+        # 不把整个分片读进内存（一次 30 秒 720p 约 10MB，多设备并发就是内存尖峰），
+        # 直接分块落盘到 .part，写完再原子改名；同时放宽本次连接的读超时。
+        try:
+            self.connection.settimeout(180)
+        except Exception:
+            pass
+        tmp = fpath + ".part"
+        written = 0
+        try:
+            with open(tmp, "wb") as f:
+                left = length
+                while left > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, left))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    left -= len(chunk)
+                    written += len(chunk)
+            if written != length:
+                raise ValueError(f"incomplete body {written}/{length}")
+            os.replace(tmp, fpath)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            self._send_json({"ok": False, "err": f"upload failed: {e}"}, 400)
+            return
 
         self.send_response(200)
         self._set_cors()
@@ -1657,6 +1749,52 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
 
     # ---- 合并 webm 分片 → 10 分钟 MP4 ----
+    # 单次 ffmpeg 最多吃多少个输入分片：一整夜的录像有上千个 30 秒分片，
+    # 旧实现把全部 -i 和全部 concat 滤镜塞进一条命令，命令行长度与滤镜图规模
+    # 都会爆掉（OOM / 参数过长 / 跑几小时）。现改为分批编码 + 无损拼接。
+    MAX_MERGE_INPUTS = 40
+
+    def _seg_sort_key(self, fn):
+        m = re.search(r"_seg(\d+)\.webm$", fn)
+        return int(m.group(1)) if m else 0
+
+    def _encode_seg_group(self, dev_dir, session_key, files, out_pat):
+        """把一批 webm 分片编码成（可能被切成 10 分钟的）MP4 段，返回产出文件列表"""
+        n = len(files)
+        inputs = []
+        for p in files:
+            inputs += ["-i", p]
+        concat = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + \
+                 f"concat=n={n}:v=1:a=1[v][a]"
+        # 水印：标签 + 年月日 时分秒。时间基准取「本批首个分片的段开始时间」，
+        # 这样分批合并时每一批的水印时间都从该批真实起点连续推进（取会话开始会让后续批次整体偏移）。
+        map_v = "[v]"
+        try:
+            mts = re.search(r"_(\d{8})_(\d{6})_(\d{8})_(\d{6})_seg\d+\.webm$",
+                            os.path.basename(files[0]))
+            start_epoch = int(datetime.strptime(
+                f"{mts.group(3)}_{mts.group(4)}", "%Y%m%d_%H%M%S").timestamp())
+            tag_safe = re.sub(r"[\\:'\";,\[\]%{}\x00-\x1f]", "",
+                              re.sub(r"_\d{8}_\d{6}$", "", session_key))
+            wtext = f"{tag_safe} %{{pts\\:localtime\\:{start_epoch}}}"
+            wm = (f"[v]drawtext=fontfile='{DRAWTEXT_FONT}':"
+                  f"text='{wtext}':x=20:y=20:"
+                  f"fontsize='max(20, w*0.04)':fontcolor=white:"
+                  f"box=1:boxcolor=black@0.4:boxborderw=10[vW]")
+            flt = concat + ";" + wm
+            map_v = "[vW]"
+        except Exception:
+            flt = concat
+        cmd = ([FFMPEG, "-y", "-loglevel", "error"] + inputs +
+               ["-filter_complex", flt, "-map", map_v, "-map", "[a]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                "-c:a", "aac", "-g", "150",
+                "-force_key_frames", "expr:gte(t,n_forced*600)",
+                "-f", "segment", "-segment_time", "600",
+                "-reset_timestamps", "1", out_pat])
+        subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        return sorted(glob.glob(glob.escape(out_pat).replace("%03d", "*")))
+
     def _merge_session_mp4(self, device_id, session_key, end):
         try:
             dev_dir = os.path.join(VIDEO_DIR, device_id)
@@ -1664,48 +1802,49 @@ class MyHandler(SimpleHTTPRequestHandler):
                              r"_\d{8}_\d{6}_\d{8}_\d{6}_seg(\d+)\.webm$")
             segs = []
             for fn in os.listdir(dev_dir):
-                m = pat.match(fn)
-                if m and os.path.isfile(os.path.join(dev_dir, fn)):
-                    segs.append((int(m.group(1)), os.path.join(dev_dir, fn)))
-            segs.sort(key=lambda x: x[0])
+                if pat.match(fn) and os.path.isfile(os.path.join(dev_dir, fn)):
+                    segs.append(os.path.join(dev_dir, fn))
+            segs.sort(key=self._seg_sort_key)
             if not segs:
                 return
-            n = len(segs)
-            inputs = []
-            for _, p in segs:
-                inputs += ["-i", p]
-            concat = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + \
-                     f"concat=n={n}:v=1:a=1[v][a]"
-            # 水印：标签 + 年月日 时分秒（动态时间戳，随播放从会话开始连续推进）
-            map_v = "[v]"
-            try:
-                mts = re.search(r"_(\d{8})_(\d{6})$", session_key)
-                start_epoch = int(datetime.strptime(
-                    f"{mts.group(1)}_{mts.group(2)}", "%Y%m%d_%H%M%S").timestamp())
-                tag_safe = re.sub(r"[\\:'\";,\[\]%{}\x00-\x1f]", "",
-                                  re.sub(r"_\d{8}_\d{6}$", "", session_key))
-                wtext = f"{tag_safe} %{{pts\\:localtime\\:{start_epoch}}}"
-                wm = (f"[v]drawtext=fontfile='{DRAWTEXT_FONT}':"
-                      f"text='{wtext}':x=20:y=20:"
-                      f"fontsize='max(20, w*0.04)':fontcolor=white:"
-                      f"box=1:boxcolor=black@0.4:boxborderw=10[vW]")
-                flt = concat + ";" + wm
-                map_v = "[vW]"
-            except Exception:
-                flt = concat
+
+            groups = [segs[i:i+self.MAX_MERGE_INPUTS]
+                      for i in range(0, len(segs), self.MAX_MERGE_INPUTS)]
             out_pat = os.path.join(dev_dir, session_key + "_tmp_%03d.mp4")
-            cmd = ([FFMPEG, "-y", "-loglevel", "error"] + inputs +
-                   ["-filter_complex", flt, "-map", map_v, "-map", "[a]",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-                    "-c:a", "aac", "-g", "150",
-                    "-force_key_frames", "expr:gte(t,n_forced*600)",
-                    "-f", "segment", "-segment_time", "600",
-                    "-reset_timestamps", "1", out_pat])
-            subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            if len(groups) == 1:
+                parts = self._encode_seg_group(dev_dir, session_key, groups[0], out_pat)
+            else:
+                # 第一步：每 40 个分片编码成一批（含 10 分钟切段），全部可播
+                batch_files = []
+                for gi, g in enumerate(groups):
+                    bpat = os.path.join(dev_dir, f"{session_key}_g{gi:03d}_%03d.mp4")
+                    batch_files.extend(self._encode_seg_group(dev_dir, session_key, g, bpat))
+                if not batch_files:
+                    return
+                # 第二步：按顺序无损拼接（同编码参数，不再重编码），再切成 10 分钟一段
+                listf = os.path.join(dev_dir, session_key + "_concat.txt")
+                with open(listf, "w", encoding="utf-8") as f:
+                    for p in batch_files:
+                        f.write("file '" + p.replace("'", "'\\''") + "'\n")
+                cmd = ([FFMPEG, "-y", "-loglevel", "error",
+                        "-f", "concat", "-safe", "0", "-i", listf,
+                        "-c", "copy",
+                        "-f", "segment", "-segment_time", "600",
+                        "-reset_timestamps", "1", out_pat])
+                subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                for p in batch_files:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                try:
+                    os.remove(listf)
+                except OSError:
+                    pass
+                parts = sorted(glob.glob(os.path.join(dev_dir, session_key + "_tmp_*.mp4")))
+
             # 重命名为 {标签}_{开始}_{结束}_第N段.mp4
-            tmp = glob.glob(os.path.join(dev_dir, session_key + "_tmp_*.mp4"))
-            tmp.sort()
-            for idx, p in enumerate(tmp):
+            for idx, p in enumerate(parts):
                 new = os.path.join(dev_dir, f"{session_key}_{end}_第{idx+1}段.mp4")
                 os.replace(p, new)
         except Exception:
@@ -1778,13 +1917,6 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.wfile.write(json.dumps({"ok": True, "count": count,
                                      "url": f"/logs/exports/{fname}",
                                      "size": os.path.getsize(path)}, ensure_ascii=False).encode("utf-8"))
-
-    def _send_json(self, obj, status=200):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
     def _handle_log_files(self):
         """GET /api/log/files —— logs/ 下的日志 HTML 名称（不含 .html），供导出界面列出"""
@@ -1859,6 +1991,8 @@ class MyHandler(SimpleHTTPRequestHandler):
                     sessions.append({"deviceId": dev, "tag": tag, "sessionStart": start,
                                      "sessionKey": key, "segments": g["segments"],
                                      "mp4s": g["mp4s"], "meta": meta})
+        # 最新的会话排在最前：旧实现按目录字典序返回，长跑之后回看页要先滚过一大堆旧会话
+        sessions.sort(key=lambda s: (s.get("sessionStart") or ""), reverse=True)
         self.send_response(200)
         self._set_cors()
         self.send_header("Content-Type", "application/json")
@@ -1893,9 +2027,17 @@ class MyHandler(SimpleHTTPRequestHandler):
         timeText = str(payload.get("timeText", "") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         ts = str(payload.get("timeTs", ""))
         stamp = _stamp_from_time_text(timeText)
-        date = datetime.now().strftime("%Y-%m-%d")
+        # 事件归属日期按「记录自身的时间」判定，而不是上报时刻：
+        # 23:59 触发、00:01 才上传的记录，旧实现会被写进第二天的日志页，
+        # 导致「昨天」页面永远缺最后一条、今天页面多出一条。
+        m_date = re.match(r"(\d{4}-\d{2}-\d{2})", timeText)
+        date = m_date.group(1) if m_date else datetime.now().strftime("%Y-%m-%d")
         # 录音解码落盘为独立文件：logs/audio/年月日时分秒.<后缀>，数据库只存 URL
-        audio_url = save_record_audio(stamp, audio_raw, mime)
+        if len(audio_raw) > MAX_AUDIO_DATAURL:
+            print(f"[音频] dataURL 超限 {len(audio_raw)/1048576:.1f}MB，拒绝落盘（疑似客户端样本缓冲失控）")
+            audio_url = ""
+        else:
+            audio_url = save_record_audio(stamp, audio_raw, mime)
         lat_raw = payload.get("lat")
         lon_raw = payload.get("lon")
         # 位置直接采用客户端已转换好的地址（客户端定位后经 /api/regeo 解析并缓存），
@@ -1928,11 +2070,12 @@ class MyHandler(SimpleHTTPRequestHandler):
         append_log_record(date, record)
 
         # 日志页外壳：每个标签每天一个独立 HTML（记录仍共用数据库，页面按标签过滤）
-        daily_path = get_daily_log_filename(tag)
+        # 文件名必须与记录日期一致，否则跨零点上报的记录会写进「今天」的页面里
+        daily_path = get_daily_log_filename(tag, date)
         self._ensure_log_shell(daily_path, date, False, loc_line, tag)
         # 凌晨 01:00~06:00：额外的凌晨日志页（同样按标签分离，页面按小时+标签过滤）
         if _is_early(record):
-            self._ensure_log_shell(get_early_morning_log_filename(tag), date, True, loc_line, tag)
+            self._ensure_log_shell(get_early_morning_log_filename(tag, date), date, True, loc_line, tag)
 
         self.send_response(200)
         self._set_cors()
@@ -2009,45 +2152,8 @@ class MyHandler(SimpleHTTPRequestHandler):
             base = os.path.realpath(AUDIO_DIR)
             fpath = os.path.realpath(os.path.join(AUDIO_DIR, rel))
             if os.path.commonpath([base, fpath]) == base and os.path.isfile(fpath):
-                ctype = {"webm": "audio/webm", "ogg": "audio/ogg", "m4a": "audio/mp4",
-                         "mp3": "audio/mpeg", "wav": "audio/wav"}.get(
-                    fpath.rsplit(".", 1)[-1].lower(), "application/octet-stream")
-                size = os.path.getsize(fpath)
-                # 支持 Range 请求（Safari/iOS 的 <audio> 播放需要 206 分段响应，否则静默失败）
-                start, end = 0, size - 1
-                rng = self.headers.get("Range") or ""
-                m = re.match(r"bytes=(\d*)-(\d*)", rng)
-                partial = False
-                if m and size:
-                    a, b = m.group(1), m.group(2)
-                    if a:
-                        start = int(a)
-                        end = int(b) if b else size - 1
-                    elif b:  # bytes=-N：最后 N 字节
-                        start = max(0, size - int(b))
-                    end = min(end, size - 1)
-                    if start > end or start >= size:
-                        self.send_response(416)
-                        self.send_header("Content-Range", f"bytes */{size}")
-                        self.end_headers()
-                        return
-                    partial = True
-                self.send_response(206 if partial else 200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(end - start + 1))
-                self.send_header("Accept-Ranges", "bytes")
-                if partial:
-                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-                self.end_headers()
-                with open(fpath, "rb") as f:
-                    f.seek(start)
-                    left = end - start + 1
-                    while left > 0:               # 分块写出，避免大文件整体读入内存
-                        chunk = f.read(min(512 * 1024, left))
-                        if not chunk:
-                            break
-                        left -= len(chunk)
-                        self.wfile.write(chunk)
+                ctype = _EXT_MIME.get(fpath.rsplit(".", 1)[-1].lower(), "application/octet-stream")
+                self._serve_file_range(fpath, ctype)
             else:
                 self.send_error(404, "audio not found")
             return
@@ -2058,13 +2164,12 @@ class MyHandler(SimpleHTTPRequestHandler):
             fpath = os.path.realpath(os.path.join(VIDEO_DIR, rel))
             # 真实路径包含检查，防止 ../ 穿越到 videos 之外
             if os.path.commonpath([base, fpath]) == base and os.path.isfile(fpath):
-                self.send_response(200)
-                self.send_header("Content-Type", "video/mp4" if fpath.endswith(".mp4") else "video/webm")
-                self.send_header("Content-Length", str(os.path.getsize(fpath)))
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                with open(fpath, "rb") as f:
-                    self.wfile.write(f.read())
+                ctype = "video/mp4" if fpath.endswith(".mp4") else (
+                    "video/webm" if fpath.endswith(".webm") else "application/octet-stream")
+                # 旧实现把整个文件 f.read() 进内存再一次性写出：
+                # 一个 10 分钟 MP4 动辄数百 MB，两台设备同时拖进度条就能把服务端内存打满；
+                # 而且只宣告了 Accept-Ranges 却不处理 Range，Safari 里视频无法拖动/续播。
+                self._serve_file_range(fpath, ctype)
                 return
             self.send_error(404)
             return
@@ -2121,10 +2226,6 @@ class MyHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"ok": False, "err": str(e)}).encode("utf-8"))
             except Exception:
                 pass
-
-    def end_headers(self):
-        self._set_cors()
-        super().end_headers()
 
     # 连接级超时：防止卡住的客户端长期占用线程
     timeout = 60

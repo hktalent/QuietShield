@@ -22,6 +22,7 @@ h1{font-size:17px;margin-bottom:4px}
 .seg .cap{font-size:10px;color:var(--muted);font-family:monospace;margin-top:3px}
 .empty{color:var(--muted);text-align:center;padding:30px;font-size:13px}
 .badge{font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid var(--amber);color:var(--amber)}
+.more{margin-top:8px;padding:5px 12px;border:1px solid var(--line);border-radius:6px;background:#16202A;color:var(--text);cursor:pointer;font-size:11px}
 </style>
 </head>
 <body>
@@ -41,22 +42,23 @@ async function load(){
     if(!data.ok) throw new Error(data.err||"加载失败");
     var sessions=data.sessions||[];
     st.textContent="共 "+sessions.length+" 个会话（设备指纹为目录名，天然隔离多设备，互不冲突）";
-    if(!sessions.length){ list.innerHTML='<div class="empty">暂无录像。在监测台点「开始录像」，每 5 秒分片实时上传到这里。</div>'; return; }
+    if(!sessions.length){ list.innerHTML='<div class="empty">暂无录像。在监测台点「开始监测」，每 30 秒分片实时上传到这里。</div>'; return; }
     list.innerHTML="";
     sessions.forEach(function(s){
       var m=s.meta||{};
-      var segHtml;
-      if(s.mp4s && s.mp4s.length){
-        // 合并后的 10 分钟 MP4 为主
-        segHtml = s.mp4s.map(function(mp){
-          return '<div class="seg"><video controls preload="metadata" src="'+mp.url+'"></video>'+
-                 '<div class="cap">MP4 · 第'+mp.part+'段</div></div>';
-        }).join("");
-      } else {
-        segHtml = (s.segments||[]).map(function(seg){
-          return '<div class="seg"><video controls preload="metadata" src="'+seg.url+'"></video>'+
-                 '<div class="cap">seg#'+seg.index+' · '+seg.segStart+' → '+seg.segEnd+'</div></div>';
-        }).join("");
+      // 只先渲染前 N 段：整夜录像有上千个分片，一次性塞上千个 <video> 会让页面直接卡死
+      var MAX_FIRST = 12;
+      var items = (s.mp4s && s.mp4s.length) ? s.mp4s.map(function(mp){
+            return {url:mp.url, cap:"MP4 · 第"+mp.part+"段"};
+          }) : (s.segments||[]).map(function(seg){
+            return {url:seg.url, cap:"seg#"+seg.index+" · "+seg.segStart+" → "+seg.segEnd};
+          });
+      function segEl(it){
+        var d=document.createElement("div");
+        d.className="seg";
+        d.innerHTML='<video controls preload="none" src="'+it.url+'"></video>'+
+                    '<div class="cap">'+it.cap+'</div>';
+        return d;
       }
       var metaTxt="时长 "+((m.durationSec||"--")+"s")+" · 峰值 "+(m.peakDb||"--")+" dB"+
                   ((s.mp4s&&s.mp4s.length)?(" · MP4 "+s.mp4s.length+" 段"):(" · 分片 "+((s.segments||[]).length)+" 段"));
@@ -65,8 +67,21 @@ async function load(){
       d.className="session";
       d.innerHTML='<div class="head"><span class="dev">📱 设备 '+s.deviceId+'</span>'+
         '<span class="badge">🏷 '+s.tag+'</span></div>'+
-        '<div class="meta">开始 '+s.sessionStart+' · '+endTxt+' · '+metaTxt+'</div>'+
-        '<div class="segs">'+segHtml+'</div>';
+        '<div class="meta">开始 '+s.sessionStart+' · '+endTxt+' · '+metaTxt+'</div>';
+      var segsDiv=document.createElement("div");
+      segsDiv.className="segs";
+      items.slice(0, MAX_FIRST).forEach(function(it){ segsDiv.appendChild(segEl(it)); });
+      d.appendChild(segsDiv);
+      if(items.length > MAX_FIRST){
+        var more=document.createElement("button");
+        more.type="button"; more.className="more";
+        more.textContent="显示全部 "+items.length+" 段 ▾";
+        more.onclick=function(){
+          items.slice(MAX_FIRST).forEach(function(it){ segsDiv.appendChild(segEl(it)); });
+          more.remove();
+        };
+        d.appendChild(more);
+      }
       list.appendChild(d);
     });
   }catch(e){

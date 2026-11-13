@@ -91,9 +91,27 @@ function ensureStream(){
 var audioCtx=null, analyser=null, micData=null;
 var sampleSrc=null, sampleGain=null, sampleHp=null, sampleComp=null, sampleDest=null;
 const SAMPLE_HP_FREQ = 120;   // 样本高通切除频点：滤掉低频"嗡嗡"背景（电源/电机低频），保留震楼器撞击瞬态
+const SAMPLE_GAIN = 3;        // 样本录音放大增益（原始响度偏低，放大后直接播放可听）
 var scopeBuf=[];
-var ltFz = 5 * 600; // N分钟
-var scopeEnv=[];   // 5分钟 dB 包络（每100ms一点），横轴呈现近5分钟突发噪声
+
+/* 5 分钟 dB 包络：定长环形缓冲（每 100ms 一点）。
+ * 旧实现用数组 push + splice 丢弃头部，每 100ms 复制 3000 个对象，
+ * 长时间监测下产生持续的 GC 压力；改为 Float32/Float64 定长环，零分配。 */
+var ENV_CAP = 3000;                  // 5 分钟 / 100ms
+var envT = new Float64Array(ENV_CAP); // 采样时间戳
+var envDb = new Float32Array(ENV_CAP);// 对应 dB
+var envHead = 0;                      // 下一个写入位置
+var envLen = 0;                       // 有效点数（≤ENV_CAP）
+function envPush(t, db){
+  envT[envHead] = t; envDb[envHead] = db;
+  envHead = (envHead + 1) % ENV_CAP;
+  if(envLen < ENV_CAP) envLen++;
+}
+/* 逻辑下标（0 = 最旧）→ 环形物理下标 */
+function envIdx(i){
+  var k = envHead - envLen + i;
+  return ((k % ENV_CAP) + ENV_CAP) % ENV_CAP;
+}
 var hoverX=-1;     // 波形图悬停 x（CSS像素），-1 表示未悬停
 var soundLive=false;
 var S={sound:0};
@@ -157,8 +175,7 @@ function computeDb(){
   if(scopeBuf.length>400) scopeBuf = scopeBuf.slice(-400);
 
   // 5分钟 dB 包络：记录当前时间戳与 dB，供波形图呈现近 5 分钟的突发噪声与悬停取值
-  scopeEnv.push({t: Date.now(), db: DB.value});
-  if(scopeEnv.length > ltFz) scopeEnv.splice(0, scopeEnv.length-ltFz);
+  envPush(Date.now(), DB.value);
 
   if(!overSession.active){
     if(noiseFloorSamples < noiseFloorCalSec*10){
@@ -302,111 +319,157 @@ function fetchLogAudioMap(date){
   });
 }
 
-// ===== 噪声样本：分段常驻录音（每段带头可播）+ 触发前判断（dB>背景才纳入、最多2秒） =====
+/* ===== 噪声样本：环形常驻录音（每段带头可播） =====
+ * 事故背景：旧实现「事件期间永不重建录音段」，只要噪声持续不落（震楼器整夜运转），
+ * ringSeg 就会无限增长——实测出现过单条 120 秒记录对应 62MB webm（相当于把整晚的音频
+ * 全拼进一个 blob）。随后 FileReader 读 62MB 做 base64、再 POST 上兆的 JSON，
+ * Safari 主线程被堵死，浏览器卡死。现改为三重护栏：
+ *   1) 单段硬上限 RING_MAX_MS（触发前 ≤10s + 事件 ≤60s + 余量），超限立即切段；
+ *   2) 单段字节上限 RING_MAX_BYTES，超限丢新片（宁可少一段尾巴，也不拖死浏览器）；
+ *   3) 空闲时每 RING_RESTART_MS 重建一次录音器（旧实现 2s 建一个实例，
+ *      1 小时 1800 个 MediaRecorder，Safari 不会及时回收 → 内存持续上涨）。 */
 var audioClipRecorder = null;
-var ringSeg = [];              // 当前录音段的片数组（每项 {db, blob}），样本从段头拼 → 可播
+var ringSeg = [];              // 当前录音段的片数组（每项 {db, blob, ms}），从段头拼 → 可播
+var ringBytes = 0;             // 当前段累计字节
+var ringT0 = 0;                // 当前段开录时间戳
 var ringTimer = null;
+var ringCapWarned = false;
 const RING_SLICE_MS = 1000;    // 分片/采样间隔（1 秒一片）
-const RING_RESTART_MS = 2000;  // 常态每 2 秒重建一段，保证触发前最多约 2 秒
-const LEAD_MAX_MS = 2000;      // 触发前最多向前 2 秒
-const LEAD_DB_OFFSET = 3;      // 触发前该段 dB 高于背景底噪这个量才算“不同于背景”，才纳入
-const SAMPLE_GAIN = 3;          // 样本录音放大增益（原始响度偏低，放大后直接播放可听）
+const RING_RESTART_MS = 10000; // 空闲时每 10 秒重建一段：触发前最多约 10 秒（比原来 2 秒更有上下文，实例数降 5 倍）
+const RING_MAX_MS = 90000;     // 单段最长 90 秒，超过立即切段，杜绝无界增长
+const RING_MAX_BYTES = 8*1024*1024;  // 单段字节硬上限（正常 90 秒 opus 约 1MB，远达不到）
+
 function ringStart(){
   if(!window.MediaRecorder) return;   // iOS 12 Safari 无 MediaRecorder，跳过样本录音（仅监测 dB）
   if(!combinedStream) return;
   var at = combinedStream.getAudioTracks()[0];
   if(!at) return;
   var buf = [];                // 本 recorder 独立片数组（旧段收尾不会污染新段）
-  ringSeg = buf;
+  ringSeg = buf; ringBytes = 0; ringT0 = Date.now(); ringCapWarned = false;
   var opts = { mimeType: "audio/webm" };
   if(!MediaRecorder.isTypeSupported(opts.mimeType)) opts = { mimeType: "" };
   try{
+    // sampleDest.stream 复用同一个 MediaStreamDestination，不每段新建 MediaStream
     var recStream = (sampleDest && sampleDest.stream) ? sampleDest.stream : new MediaStream([at]);
     var rec = new MediaRecorder(recStream, opts);
-    rec.ondataavailable = function(e){ if(e.data && e.data.size>0) buf.push({ db: DB.value, blob: e.data }); };
+    rec.ondataavailable = function(e){
+      if(!e.data || e.data.size <= 0) return;
+      if(ringBytes + e.data.size > RING_MAX_BYTES){
+        if(!ringCapWarned){ ringCapWarned = true; console.warn("噪声样本单段超字节上限，已丢弃后续分片"); }
+        return;
+      }
+      buf.push({ db: DB.value, blob: e.data, ms: Date.now() });
+      ringBytes += e.data.size;
+    };
     rec.start(RING_SLICE_MS);
     audioClipRecorder = rec;
   }catch(err){ audioClipRecorder = null; console.warn("噪声样本录音启动失败", err); }
 }
+/* 切段：先解引用旧实例再开新段。旧的实现把 ringStart 挂在 old.onstop 上，
+ * 一旦 stop 与 onstop 之间又被 ensureRing 触发，就会叠出多条录音器（互相污染 buf）。 */
 function rebuildRing(){
-  if(audioClipRecorder && audioClipRecorder.state === "recording"){
-    var old = audioClipRecorder;
-    old.onstop = function(){ ringStart(); };   // 等旧段完全停止再开新段，杜绝重叠走样
-    old.stop();
-  } else {
-    ringStart();
+  var old = audioClipRecorder;
+  audioClipRecorder = null;
+  if(old){
+    try{ old.ondataavailable = null; if(old.state === "recording") old.stop(); }catch(e){}
   }
+  ringStart();
 }
 function ensureRing(){
-  if(overSession.active) return;      // 事件期间不重建，保持事件段连续从头
-  if(audioClipRecorder && audioClipRecorder.state === "recording") rebuildRing();
+  if(!audioClipRecorder){ ringStart(); return; }
+  if(audioClipRecorder.state !== "recording") return;   // 正在停止，等下一拍
+  var age = Date.now() - ringT0;
+  if(overSession.active){
+    // 事件期间保持连续不切段；但到硬上限先把这一段落盘再切，绝不无界增长
+    if(age >= RING_MAX_MS) closeAndSaveSession();
+    return;
+  }
+  if(age >= RING_RESTART_MS) rebuildRing();
 }
 function startRingRecording(){
   if(!combinedStream) return;
+  if(audioClipRecorder){ try{ audioClipRecorder.stop(); }catch(e){} audioClipRecorder = null; }
   ringStart();
   if(ringTimer) clearInterval(ringTimer);
-  ringTimer = setInterval(ensureRing, RING_RESTART_MS);
+  ringTimer = setInterval(ensureRing, 1000);
 }
 function stopRingRecording(){
   if(ringTimer){ clearInterval(ringTimer); ringTimer=null; }
-  if(audioClipRecorder){ try{ audioClipRecorder.stop(); }catch(e){} }
-  audioClipRecorder = null;
-  ringSeg = [];
-}
-function stopRecordAudio(){
-  return new Promise(function(resolve){
-    if(!audioClipRecorder || !ringSeg.length){ resolve(null); return; }
-    // 当前段从头（带头片）拼 → 可正常播放；含触发前（需要时≤2秒）+ 事件时段
-    var blobs = [];
-    for(var k = 0; k < ringSeg.length; k++) blobs.push(ringSeg[k].blob);
-    var blob = new Blob(blobs, {type: audioClipRecorder.mimeType || "audio/webm"});
-    if(blob.size < 200){ resolve(null); return; }
-    var reader = new FileReader();
-    reader.onloadend = function(){ resolve(reader.result); };
-    reader.readAsDataURL(blob);
-  });
-}
-async function closeAndSaveSession(){
-  if(!overSession.active) return;
-  var startTs = overSession.startTs;
-  var peak = overSession.peakDb;
-  var nowTs = Date.now();
-  var durSec = ((nowTs - startTs)/1000).toFixed(1);
-  var audioB64 = await stopRecordAudio();
-  // 样本无效/为空、持续过短、或峰值太小 → 不记录也不上传（避免无效落盘），直接结束本段
-  if(!validAudio(audioB64) || parseFloat(durSec) < MIN_RECORD_SEC || peak.toFixed(1) < 39){
-    postSessionCooldownTs = Date.now();
-    resetOverSession();
-    return;
+  if(audioClipRecorder){
+    try{ audioClipRecorder.ondataavailable = null; audioClipRecorder.stop(); }catch(e){}
   }
-  var fullTimeStr = formatFullTime(startTs);
-  var _lat = gpsLat!==null ? gpsLat.toFixed(6):null;
-  var _lon = gpsLon!==null ? gpsLon.toFixed(6):null;
-  // 记录时携带已解析的地址（后台定时器已解析，直接复用，不阻塞）
-  var _addr = currentAddress || "";
-  // 先以 audio=""（上传中）入列渲染，待服务端返回 URL 后回填；全程不写 IndexedDB / base64
-  var rec = {
-    timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
-    peakDb: peak.toFixed(1), tag: getTag(),
-    lat: _lat, lon: _lon, address: _addr, audio: ""
-  };
-  logArr.unshift(rec);
-  if(logArr.length>300) logArr.length=300;
-  saveLog(); renderLog();
-  postSessionCooldownTs = Date.now();  // 事件结束进入 5 秒冷却，期内不更新背景
-  resetOverSession();
-  // 异步上传：成功回填服务端音频 URL 并重渲染；失败标记上传失败
-  pushLogToServer({
-    timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
-    peakDb: peak.toFixed(1), tag: getTag(),
-    audioData: audioB64,
-    lat: _lat, lon: _lon,
-    address: _addr   // 客户端已转换好的地址，服务端直接写入日志，不再重复解析
-  }).then(function(audioUrl){
-    if(audioUrl){ rec.audio = audioUrl; rec._uploadErr = false; }
-    else { rec._uploadErr = true; }
-    saveLog(); renderLog();
+  audioClipRecorder = null;
+  ringSeg = []; ringBytes = 0;
+}
+/* 同步截取当前段（不读文件、不做 base64，避免主线程阻塞） */
+function takeRingBlob(){
+  if(!ringSeg.length) return null;
+  var blobs = [], total = 0;
+  for(var k = 0; k < ringSeg.length; k++){ blobs.push(ringSeg[k].blob); total += ringSeg[k].blob.size; }
+  if(total < 200) return null;
+  var mime = (audioClipRecorder && audioClipRecorder.mimeType) || "audio/webm";
+  return new Blob(blobs, {type: mime});
+}
+function blobToDataUrl(blob){
+  return new Promise(function(resolve){
+    try{
+      var reader = new FileReader();
+      reader.onloadend = function(){ resolve(reader.result || null); };
+      reader.onerror = function(){ resolve(null); };
+      reader.readAsDataURL(blob);
+    }catch(e){ resolve(null); }
   });
+}
+/* 结束一段并落库。关键改动：
+ *   - 进入函数立刻 resetOverSession()（同步），此后 processOverThreshold 不会再重复调用本函数
+ *     （旧实现把 reset 放在 await 之后，60 秒触发时同一段会被反复 close → 反复做 base64 → 卡死）；
+ *   - 先同步取 blob + 切段，再异步做 base64 / 上传，主线程不长时间被占。 */
+var closingSession = false;
+async function closeAndSaveSession(){
+  if(!overSession.active || closingSession) return;
+  closingSession = true;
+  try{
+    var startTs = overSession.startTs;
+    var peak = overSession.peakDb;
+    var nowTs = Date.now();
+    var durSec = ((nowTs - startTs)/1000).toFixed(1);
+    resetOverSession();                        // 同步结束，防重入
+    postSessionCooldownTs = nowTs;             // 事件结束进入冷却期，期内不更新背景
+    var blob = takeRingBlob();                 // 同步截取
+    // 立刻切段：下一段从新文件头开始，永不无限增长。停止监测时只清空缓冲不再新建录音器
+    if(running) rebuildRing(); else { ringSeg = []; ringBytes = 0; }
+    if(!blob || parseFloat(durSec) < MIN_RECORD_SEC || peak.toFixed(1) < 39) return;
+    var audioB64 = await blobToDataUrl(blob);
+    // 样本无效/为空、持续过短、或峰值太小 → 不记录也不上传（避免无效落盘），直接结束本段
+    if(!validAudio(audioB64)) return;
+    var fullTimeStr = formatFullTime(startTs);
+    var _lat = gpsLat!==null ? gpsLat.toFixed(6):null;
+    var _lon = gpsLon!==null ? gpsLon.toFixed(6):null;
+    // 记录时携带已解析的地址（后台定时器已解析，直接复用，不阻塞）
+    var _addr = currentAddress || "";
+    // 先以 audio=""（上传中）入列渲染，待服务端返回 URL 后回填；全程不写 IndexedDB / base64
+    var rec = {
+      timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
+      peakDb: peak.toFixed(1), tag: getTag(),
+      lat: _lat, lon: _lon, address: _addr, audio: ""
+    };
+    logArr.unshift(rec);
+    if(logArr.length>300) logArr.length=300;
+    saveLog(); prependLogRow(rec);        // 只插入新增这一行，不整表重绘
+    // 异步上传：成功回填服务端音频 URL 并就地更新该行；失败标记上传失败
+    pushLogToServer({
+      timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
+      peakDb: peak.toFixed(1), tag: getTag(),
+      audioData: audioB64,
+      lat: _lat, lon: _lon,
+      address: _addr   // 客户端已转换好的地址，服务端直接写入日志，不再重复解析
+    }).then(function(audioUrl){
+      if(audioUrl){ rec.audio = audioUrl; rec._uploadErr = false; }
+      else { rec._uploadErr = true; }
+      saveLog(); updateLogRowAudio(rec);
+    });
+  }catch(e){ console.warn("保存噪声记录失败", e); }
+  finally { closingSession = false; }   // 必须 finally：try 内的 return 会跳过语句，守卫卡住就再也关不掉会话
 }
 
 /* ===== 超标检测 ===== */
@@ -415,7 +478,7 @@ const TRIG_OFFSET = 6;
 const RELEASE_OFFSET = 3;   // 结束线 = 背景 + 3dB（低于触发线 6dB），噪声真正回落到常态附近才停
 const RELEASE_HYSTERESIS = 5;   // 白天/夜间结束线比触发线低 5dB（滞回）：常态噪声在阈值附近波动也能正常结束
 const HOLD_AFTER_FALL = 0.4;
-const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 2 分钟一段，超时切段重记
+const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 60 秒一段，超时切段重记（配合样本段硬上限 90 秒）
 
 function setThr(){
   var h = new Date().getHours();
@@ -487,12 +550,26 @@ function liveLoop(){
 
 /* ---------- 绘制 ---------- */
 var gGauge={f:0,c:"#22D3EE",t:"--"}; // 声压计当前绘制状态，用于窗口缩放时重绘（含空闲态）
+
+/* 画布尺寸缓存：只在「像素尺寸或 DPR 变化」时才重设 backing store。
+ * 旧实现每帧都执行 canvas.width = w*dpr（等于重建一张 GPU 纹理 + 重置全部状态），
+ * 10Hz 刷新下 Safari 的纹理/内存反复申请释放，是长时间监测后卡死的另一主因。 */
+function fitCanvas(cv){
+  var dpr = window.devicePixelRatio || 1;
+  var w = Math.max(1, cv.clientWidth || 1), h = Math.max(1, cv.clientHeight || 1);
+  var pw = Math.round(w*dpr), ph = Math.round(h*dpr);
+  if(cv._pw !== pw || cv._ph !== ph || cv._dpr !== dpr){
+    cv.width = pw; cv.height = ph;
+    cv._pw = pw; cv._ph = ph; cv._dpr = dpr;
+  }
+  var c = cv._ctx || (cv._ctx = cv.getContext("2d"));
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {c:c, w:w, h:h};
+}
+
 function drawArc(canvas,frac,color,dbText){
-  var dpr=window.devicePixelRatio||1;
-  var w=canvas.clientWidth,h=canvas.clientHeight;
-  canvas.width=w*dpr; canvas.height=h*dpr;
-  var c=canvas.getContext("2d");
-  c.setTransform(dpr,0,0,dpr,0,0);
+  if(!canvas) return;
+  var fit = fitCanvas(canvas), c = fit.c, w = fit.w, h = fit.h;
   // 环居中偏下，完整落在画布内（顶部 cy-r、底部 cy+r≈h），数字画在环内部
   var r=Math.min(w/2 - 10, h*0.42), cx=w/2, cy=h*0.58;
   var a0=Math.PI*0.9, a1=Math.PI*2.1;
@@ -519,10 +596,10 @@ function drawArc(canvas,frac,color,dbText){
   }
 }
 function drawScope(){
-  var cv=$("scope"); var dpr=window.devicePixelRatio||1;
-  var w=cv.clientWidth,h=cv.clientHeight;
-  cv.width=w*dpr; cv.height=h*dpr;
-  var c=cv.getContext("2d"); c.setTransform(dpr,0,0,dpr,0,0);
+  var cv=$("scope");
+  if(!cv) return;
+  if(document.hidden) return;           // 页面在后台时不做无意义的绘制
+  var fit = fitCanvas(cv), c = fit.c, w = fit.w, h = fit.h;
   c.fillStyle="#080C10"; c.fillRect(0,0,w,h);
   var DB_MIN=30, DB_MAX=90;
   // 纵向 dB 刻度线（40/60/80）
@@ -539,16 +616,26 @@ function drawScope(){
     c.strokeStyle="#14202A"; c.beginPath(); c.moveTo(xx,0); c.lineTo(xx,h); c.stroke();
     c.fillStyle="#3A4A57"; c.fillText("-"+(5-m)+"min", xx+2, h-4);
   }
-  if(!scopeEnv.length) return;
-  // 5分钟 dB 包络线：最新在右，dB 越高凸起越高（从底部向上），突发噪声清晰可见
-  var n=scopeEnv.length;
+  if(!envLen) return;
+  // 5分钟 dB 包络线：最新在右，dB 越高凸起越高（从底部向上），突发噪声清晰可见。
+  // 按像素抽稀：画布再宽也只画 ~min(envLen, 2*宽度) 个点，避免每帧上万次 lineTo。
+  var n = envLen;
+  var step = Math.max(1, Math.ceil(n / Math.max(200, w * 2)));
   c.strokeStyle="#22D3EE"; c.lineWidth=1.8; c.beginPath();
-  for(var i=0;i<n;i++){
-    var dbv=Math.max(0,Math.min(1,(scopeEnv[i].db-DB_MIN)/(DB_MAX-DB_MIN)));
+  var started=false;
+  for(var i=0;i<n;i+=step){
+    var k=envIdx(i);
+    var dbv=Math.max(0,Math.min(1,(envDb[k]-DB_MIN)/(DB_MAX-DB_MIN)));
     var age=(n-1-i)*100;               // 距当前毫秒数（每点100ms）
     var x=w - (age/300000)*w;          // 5分钟窗口，最新贴右
     var y=h - dbv*(h*0.92);
-    if(i===0) c.moveTo(x,y); else c.lineTo(x,y);
+    if(!started){ c.moveTo(x,y); started=true; } else c.lineTo(x,y);
+  }
+  // 末点贴右（抽稀可能漏掉最后一个点）
+  if(n){
+    var kl=envIdx(n-1);
+    var dvl=Math.max(0,Math.min(1,(envDb[kl]-DB_MIN)/(DB_MAX-DB_MIN)));
+    c.lineTo(w, h - dvl*(h*0.92));
   }
   c.stroke();
   // 悬停参考线 + 时间/分贝提示
@@ -556,13 +643,13 @@ function drawScope(){
     var age2=Math.max(0, (w-hoverX)/w * 300000);
     var idx=n-1 - Math.round(age2/100);
     idx=Math.max(0,Math.min(n-1,idx));
-    var pt=scopeEnv[idx];
+    var kk=envIdx(idx), ptT=envT[kk], ptDb=envDb[kk];
     c.strokeStyle="rgba(245,166,35,0.85)"; c.lineWidth=1.2;
     c.beginPath(); c.moveTo(hoverX,0); c.lineTo(hoverX,h); c.stroke();
-    var dbv2=Math.max(0,Math.min(1,(pt.db-DB_MIN)/(DB_MAX-DB_MIN)));
+    var dbv2=Math.max(0,Math.min(1,((ptDb)-DB_MIN)/(DB_MAX-DB_MIN)));
     var py=h - dbv2*(h*0.92);
     c.fillStyle="#F5A623"; c.beginPath(); c.arc(hoverX,py,3.5,0,6.283); c.fill();
-    var txt=formatFullTime(pt.t)+"  "+pt.db.toFixed(1)+" dB";
+    var txt=formatFullTime(ptT)+"  "+ptDb.toFixed(1)+" dB";
     c.font=Math.max(10,Math.round(w/55))+"px monospace";
     var tw=c.measureText(txt).width;
     var tx=hoverX - tw - 10; if(tx<4) tx=4; if(tx+tw>w-4) tx=w-tw-4;
@@ -705,7 +792,7 @@ function initAlwaysOn(){
 }
 
 /* ---------- 屏幕常亮 ---------- */
-var wakeLockTimer=null;
+var wakeLockTimer=null, _wakeLockVisBound=false;
 async function acquireWakeLock(){
   if(!("wakeLock" in navigator)){
     toast("⚠️当前浏览器不支持网页常亮，请在手机系统设置把自动锁屏设为「永不」或「充电时常亮」");
@@ -713,7 +800,6 @@ async function acquireWakeLock(){
   }
   try{
     wakeLockSentinel = await navigator.wakeLock.request('screen');
-    try{ wakeLockSentinel.addEventListener('release', function(){}); }catch(e){}
     if(wakeLockTimer) clearInterval(wakeLockTimer);
     // 浏览器节能可能自动释放 Wake Lock，每 60 秒重新获取一次，保证长时间运行不掉屏
     wakeLockTimer = setInterval(function(){
@@ -724,11 +810,19 @@ async function acquireWakeLock(){
         }).catch(function(){});
       }
     }, 60000);
-    document.addEventListener('visibilitychange', async function(){
-      if(document.visibilityState==='visible'){
-        try{ wakeLockSentinel = await navigator.wakeLock.request('screen'); }catch(e){}
-      }
-    });
+    // visibilitychange 只绑一次；旧实现每次「开始监测」都新增一个监听器，
+    // 反复启停后同一事件会触发 N 次请求，WakeLock 句柄越积越多
+    if(!_wakeLockVisBound){
+      _wakeLockVisBound = true;
+      document.addEventListener('visibilitychange', function(){
+        if(document.visibilityState === 'visible' && running){
+          navigator.wakeLock.request('screen').then(function(s){
+            try{ if(wakeLockSentinel && wakeLockSentinel.release) wakeLockSentinel.release(); }catch(e){}
+            wakeLockSentinel = s;
+          }).catch(function(){});
+        }
+      });
+    }
   }catch(err){
     toast("⚠️无法获取屏幕常亮："+err.message+"，请在系统设置把自动锁屏设为「永不」或「充电时常亮」");
     wakeLockSentinel=null;
@@ -780,6 +874,10 @@ async function uploadSegment(blob, i){
   var segEndMs = segStartMs + SEGMENT_MS;
   var segStartStr = formatToFile(segStartMs);
   var segEndStr = formatToFile(segEndMs);
+  // 上传加超时：旧实现只有一个裸 fetch，服务端/网络一旦挂住，
+  // onstop 里的 await 永不返回 → 录像链就此中断（界面仍显示"录制中"但不产新段）
+  var ctrl = ("AbortController" in window) ? new AbortController() : null;
+  var timer = ctrl ? setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, 30000) : null;
   try{
     var qs = "/api/video/upload?deviceId="+encodeURIComponent(deviceId||"unknown")
       + "&tag="+encodeURIComponent(sessionTag)
@@ -787,12 +885,15 @@ async function uploadSegment(blob, i){
       + "&segStart="+encodeURIComponent(segStartStr)
       + "&segEnd="+encodeURIComponent(segEndStr)
       + "&segIndex="+i;
-    var resp = await fetch(qs,{ method:"POST", headers:{"Content-Type":"application/octet-stream"}, body:blob });
+    var resp = await fetch(qs,{ method:"POST", headers:{"Content-Type":"application/octet-stream"},
+                                body:blob, signal: ctrl ? ctrl.signal : undefined });
     if(!resp.ok) throw new Error("HTTP "+resp.status);
     segUploaded++;
   }catch(err){
     console.warn("分片上传失败", err);
     toast("⚠️分片上传失败，将丢该段");
+  }finally{
+    if(timer) clearTimeout(timer);
   }
   updateVideoStat();
 }
@@ -858,7 +959,11 @@ function releaseStream(){
   soundLive = false;
   $("dSound").className = "dot";
   var st=$("sSound"); if(st){ st.textContent="已停止"; st.className="gstate"; }
-  if(audioCtx){ try{ audioCtx.close(); }catch(e){} audioCtx=null; analyser=null; micData=null; }
+  if(audioCtx){ try{ audioCtx.close(); }catch(e){} }
+  audioCtx=null; analyser=null; micData=null;
+  // 一并解引用样本录音链节点：否则旧 AudioContext 的节点仍被全局引用，
+  // 再次启动时若建图失败，sampleDest 会指向一条已关闭的 destination
+  sampleSrc=null; sampleGain=null; sampleHp=null; sampleComp=null; sampleDest=null;
   gGauge.f=0; gGauge.c="#22D3EE"; gGauge.t="--";
   try{ drawArc($("gSound"),0,"#22D3EE","--"); }catch(e){}
 }
@@ -905,31 +1010,76 @@ async function stopMonitor(){
  * js/player.js（顶层全局函数，index.html 先于本文件加载）。本文件的行内 onclick
  * 直接调用全局函数；exportHtmlReport 用它们的 toString() 自包含嵌入导出报告。 */
 
+/* 表格最多渲染多少行：每条有录音的记录都会实例化一个 <audio>，
+ * Safari 的媒体元素很重，300 行整表重绘会造成明显的卡顿与内存占用。 */
+var LOG_MAX_RENDER = 120;
+
+function buildLogRow(r){
+  var tr=document.createElement("tr");
+  tr.className="alarm";
+  if(r && r.timeTs!=null) tr.setAttribute("data-ts", String(r.timeTs));
+  // 地址 + 经纬度作为悬停提示（行内不再单列经纬度）
+  var locTip = r.address ? (r.address+"（"+r.lat+", "+r.lon+"）") : ((r.lat!=null?r.lat:"--")+", "+(r.lon!=null?r.lon:"--"));
+  tr.innerHTML=
+    '<td title="📍 '+locTip.replace(/"/g,'&quot;')+'">'+(r.timeText||"--")+'</td>'+
+    '<td>'+(r.tag||"--")+'</td>'+
+    '<td>'+(r.durationSec||"N/A")+'s</td>'+
+    '<td>'+r.peakDb+'</td>'+
+    '<td class="au"></td>'+
+    '<td><button type="button" class="au-btn del-btn">删除</button></td>';
+  // 音频直接引用服务器 audio 目录的 URL（不读 IndexedDB / base64），点按钮才 fetch 播放
+  tr.querySelector(".au").innerHTML = auCellHtml(r);
+  var btn = tr.querySelector(".del-btn");
+  if(btn) btn.addEventListener("click", function(){ delLog(r.timeTs); });
+  return tr;
+}
+
 function renderLog(){
   $("logCnt").textContent=logArr.length+" 条";
   var b=$("logBody");
-  if(!logArr.length){ b.innerHTML='<tr><td colspan="6" class="empty">尚无记录。</td></tr>'; return; }
   b.innerHTML="";
-  for(var i=0;i<logArr.length;i++){
-    var r=logArr[i];
-    var tr=document.createElement("tr"); tr.className="alarm";
-    // 地址 + 经纬度作为悬停提示（行内不再单列经纬度）
-    var locTip = r.address ? (r.address+"（"+r.lat+", "+r.lon+"）") : ((r.lat!=null?r.lat:"--")+", "+(r.lon!=null?r.lon:"--"));
-    tr.innerHTML=
-      '<td title="📍 '+locTip.replace(/"/g,'&quot;')+'">'+(r.timeText||"--")+'</td>'+
-      '<td>'+(r.tag||"--")+'</td>'+
-      '<td>'+(r.durationSec||"N/A")+'s</td>'+
-      '<td>'+r.peakDb+'</td>'+
-      '<td class="au"></td>'+
-      '<td><button type="button" class="au-btn del-btn">删除</button></td>';
-    // 音频直接引用服务器 audio 目录的 URL（不读 IndexedDB / base64），点按钮才 fetch 播放
-    tr.querySelector(".au").innerHTML = auCellHtml(r);
-    b.appendChild(tr);
-    // 删除本行：同步删前端列表并通知后端删除对应日志
-    (function(ts, btn){
-      if(btn) btn.addEventListener("click", function(){ delLog(ts); });
-    })(r.timeTs, tr.querySelector(".del-btn"));
+  if(!logArr.length){ b.innerHTML='<tr><td colspan="6" class="empty">尚无记录。</td></tr>'; return; }
+  var frag=document.createDocumentFragment();
+  var n=Math.min(logArr.length, LOG_MAX_RENDER);
+  for(var i=0;i<n;i++) frag.appendChild(buildLogRow(logArr[i]));
+  if(logArr.length>n){
+    var foot=document.createElement("tr");
+    foot.innerHTML='<td colspan="6" class="empty">仅显示最近 '+n+' 条（共 '+logArr.length+
+      ' 条，导出 HTML 报告含全部记录）</td>';
+    frag.appendChild(foot);
   }
+  b.appendChild(frag);
+}
+
+/* 新增一条：只插入首行，不整表重绘（旧实现每条都要重建 300 行 + 300 个 <audio>） */
+function prependLogRow(rec){
+  var b=$("logBody");
+  if(!b) return;
+  var first=b.firstChild;
+  // 清掉"尚无记录"占位行
+  if(first && first.classList && first.classList.contains("empty")) b.innerHTML="";
+  b.insertBefore(buildLogRow(rec), b.firstChild);
+  $("logCnt").textContent=logArr.length+" 条";
+  while(b.children.length > LOG_MAX_RENDER){ b.removeChild(b.lastChild); }
+}
+
+/* 上传完成后就地更新该行的录音单元格（避免重绘整表） */
+function updateLogRowAudio(rec){
+  var b=$("logBody");
+  if(!b || !rec || rec.timeTs==null) return;
+  var tr=b.querySelector('tr[data-ts="'+String(rec.timeTs)+'"]');
+  if(!tr) return;
+  var cell=tr.querySelector(".au");
+  if(cell) cell.innerHTML=auCellHtml(rec);
+}
+
+function removeLogRow(ts){
+  var b=$("logBody");
+  if(!b) return;
+  var tr=b.querySelector('tr[data-ts="'+String(ts)+'"]');
+  if(tr && tr.parentNode) tr.parentNode.removeChild(tr);
+  $("logCnt").textContent=logArr.length+" 条";
+  if(!logArr.length) renderLog();
 }
 // 依据记录的音频状态渲染录音列：有 URL → 原生播放 + 三种模式；否则显示上传中/失败/无
 function auCellHtml(r){
@@ -951,7 +1101,7 @@ async function delLog(ts){
   try{ await fetch("/api/log/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({timeTs:String(ts)})}); }
   catch(e){ console.warn("删除后端日志失败", e); }
   logArr = logArr.filter(function(x){ return x.timeTs !== ts; });
-  saveLog(); renderLog();
+  saveLog(); removeLogRow(ts);
   toast("已删除该条日志");
 }
 
@@ -1015,20 +1165,27 @@ $("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(
 $("btnExport").addEventListener("click", exportHtmlReport);
 
 // 波形图 x 轴悬停：鼠标移动时显示该位置对应的年月日 时分秒 与分贝值
+// 用 rAF 合并高频 mousemove，避免一次拖动触发几十次整幅重绘
 (function(){
-  var sc=$("scope");
+  var sc=$("scope"), rafId=0;
+  function queueDraw(){
+    if(rafId) return;
+    rafId = requestAnimationFrame(function(){ rafId=0; drawScope(); });
+  }
   if(sc){
     sc.addEventListener("mousemove", function(e){
       var r=sc.getBoundingClientRect();
       hoverX=e.clientX - r.left;
       if(hoverX<0) hoverX=-1; else if(hoverX>r.width) hoverX=r.width;
-      drawScope();
+      queueDraw();
     });
-    sc.addEventListener("mouseleave", function(){ hoverX=-1; drawScope(); });
+    sc.addEventListener("mouseleave", function(){ hoverX=-1; queueDraw(); });
   }
 })();
 
-setInterval(function(){ $("sssb").innerHTML="实时声波 - "+formatFullTime(new Date()); },1000);
+setInterval(function(){
+  var el=$("sssb"); if(el) el.textContent="实时声波 - "+formatFullTime(new Date());
+},1000);
 
 function toast(msg){
   var t=$("toast"); t.textContent=msg; t.className="toast show";
