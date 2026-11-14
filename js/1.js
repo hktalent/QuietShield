@@ -248,12 +248,55 @@ function saveLog(){
 }
 loadLog();
 
+/* ---------- 请求基址：内网可达就直连内网，避免每次 POST 都绕公网 ---------- */
+var apiBase="";
+function apiUrl(p){ return (apiBase||"")+p; }
+var _netInfo=null,_netInfoWait=[],_netInfoStarted=false;
+function startNetInfo(){
+  if(_netInfoStarted) return;
+  _netInfoStarted=true;
+  fetch("/api/netinfo",{cache:"no-store"}).then(function(r){ return r.json(); }).then(function(d){
+    _netInfo=d||{};
+    probeLan(_netInfo);
+    flushNetInfo();
+  }).catch(function(){ _netInfo={}; flushNetInfo(); });
+}
+function withNetInfo(cb){
+  if(_netInfo){ try{ cb(_netInfo); }catch(e){} return; }
+  _netInfoWait.push(cb); startNetInfo();
+}
+function flushNetInfo(){
+  var l=_netInfoWait; _netInfoWait=[];
+  for(var i=0;i<l.length;i++){ try{ l[i](_netInfo); }catch(e){} }
+}
+/* 逐个探测服务端自报的内网地址：能连上（且证书受信）才切换，否则保持公网同源 */
+function probeLan(d){
+  if(!d||!d.ok||!d.lan||!d.lan.length) return;
+  var port=d.port||parseInt(location.port||"8808",10);
+  var cands=[];
+  for(var i=0;i<d.lan.length;i++){ if(d.lan[i]!==location.hostname) cands.push(d.lan[i]); }
+  (function next(i){
+    if(i>=cands.length) return;
+    var base="https://"+cands[i]+":"+port;
+    var ctrl=window.AbortController?new AbortController():null;
+    var tm=ctrl?setTimeout(function(){ ctrl.abort(); },1500):0;
+    fetch(base+"/api/netinfo",{cache:"no-store",signal:ctrl?ctrl.signal:undefined})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(tm) clearTimeout(tm);
+        if(j&&j.ok){ apiBase=base; console.info("API 走内网直连:",apiBase); }
+        else next(i+1);
+      })
+      .catch(function(){ if(tm) clearTimeout(tm); next(i+1); });
+  })(0);
+}
+
 // 后台噪声日志推送（含设备ID，无磁/振）；成功时返回服务端落盘后的音频 URL（如 /audio/xxx.webm），失败返回空串
 const LOG_API_URL = "/api/log";
 async function pushLogToServer(record){
   try{
     record.deviceId = deviceId || "unknown";
-    var resp = await fetch(LOG_API_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(record)});
+    var resp = await fetch(apiUrl(LOG_API_URL),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(record)});
     if(!resp.ok) throw new Error("HTTP status: "+resp.status);
     var data = await resp.json().catch(function(){ return {}; });
     return (data && data.ok) ? (data.audio || "") : "";
@@ -301,7 +344,7 @@ function fetchLogAudioMap(date){
   return new Promise(function(resolve){
     var map={};
     (function page(p){
-      fetch("/api/log/list?date="+encodeURIComponent(date)+"&page="+p+"&size=200", {cache:"no-store"})
+      fetch(apiUrl("/api/log/list?date="+encodeURIComponent(date)+"&page="+p+"&size=200"), {cache:"no-store"})
         .then(function(resp){ return resp.ok ? resp.json() : {rows:[]}; })
         .then(function(data){
           var rows = (data && data.rows) || [];
@@ -568,6 +611,7 @@ function liveLoop(){
 
 /* ---------- 绘制 ---------- */
 var gGauge={f:0,c:"#22D3EE",t:"--"}; // 声压计当前绘制状态，用于窗口缩放时重绘（含空闲态）
+var envColDb=null, envColHas=null;  // 包络绘制用的「像素列 → 最大 dB」scratch，每帧复用、零分配
 
 /* 画布尺寸缓存：只在「像素尺寸或 DPR 变化」时才重设 backing store。
  * 旧实现每帧都执行 canvas.width = w*dpr（等于重建一张 GPU 纹理 + 重置全部状态），
@@ -620,90 +664,267 @@ function drawScope(){
   var fit = fitCanvas(cv), c = fit.c, w = fit.w, h = fit.h;
   c.fillStyle="#080C10"; c.fillRect(0,0,w,h);
   var DB_MIN=30, DB_MAX=90;
+  // 底部留 13px 给时间刻度文字：曲线和网格都不进入这一带，否则低噪时段（≤32dB）的折线会横穿刻度字
+  var padB=13, plotH=h-padB;
   // 纵向 dB 刻度线（40/60/80）
   c.strokeStyle="#14202A"; c.lineWidth=1;
   c.fillStyle="#3A4A57"; c.font=Math.max(9,Math.round(w/70))+"px monospace";
   for(var db=40; db<=80; db+=20){
-    var yy=h - ((db-DB_MIN)/(DB_MAX-DB_MIN))*(h*0.92);
+    var yy=plotH - ((db-DB_MIN)/(DB_MAX-DB_MIN))*(plotH*0.95);
     c.beginPath(); c.moveTo(0,yy); c.lineTo(w,yy); c.stroke();
     c.fillText(db+"dB", 3, yy-2);
   }
   // 横向时间刻度：5 分钟窗口（-5min … 现在）
   for(var m=0;m<=5;m++){
     var xx=(m/5)*w;
-    c.strokeStyle="#14202A"; c.beginPath(); c.moveTo(xx,0); c.lineTo(xx,h); c.stroke();
-    c.fillStyle="#3A4A57"; c.fillText("-"+(5-m)+"min", xx+2, h-4);
+    c.strokeStyle="#14202A"; c.beginPath(); c.moveTo(xx,0); c.lineTo(xx,plotH); c.stroke();
+    c.fillStyle="#3A4A57";
+    if(m===5){ c.textAlign="right"; c.fillText("现在", w-2, h-4); c.textAlign="left"; }  // 最右标签原来画在 w+2 被截掉
+    else c.fillText("-"+(5-m)+"min", xx+2, h-4);
   }
   if(!envLen) return;
-  // 5分钟 dB 包络线：最新在右，dB 越高凸起越高（从底部向上），突发噪声清晰可见。
-  // 按像素抽稀：画布再宽也只画 ~min(envLen, 2*宽度) 个点，避免每帧上万次 lineTo。
-  var n = envLen;
-  var step = Math.max(1, Math.ceil(n / Math.max(200, w * 2)));
+  /* 5 分钟 dB 包络：把样本按**真实时间戳**投到像素列上，每列取该列最大值（峰值保持）。
+   * 旧实现用 i += step 抽稀，网格锚在数组下标上：数据每拍前移一格，网格相位就跟着旋转，
+   * 同一个尖峰时而画到、时而漏掉 —— 真机 step=4 时只有 1/4 的帧能画到它，视觉上就是“快速闪动”。
+   * 时间锚定后网格固定在时间轴上，尖峰只会平滑左移；每列取最大值保证窄瞬态不会被抽稀丢掉。 */
+  var nowT = Date.now(), WIN = 300000;
+  var cols = Math.max(1, Math.min(4096, Math.ceil(w)));
+  if(!envColDb || envColDb.length !== cols){
+    envColDb = new Float32Array(cols);
+    envColHas = new Uint8Array(cols);
+  }
+  var cd = envColDb, ch = envColHas, n = envLen;
+  ch.fill(0);
+  for(var i=0;i<n;i++){
+    var k=envIdx(i);
+    var age0 = nowT - envT[k];
+    if(age0 < 0 || age0 > WIN) continue;               // 超出 5 分钟窗口的旧点直接忽略
+    var ci = cols - 1 - Math.round(age0 / WIN * (cols - 1));
+    if(ci < 0) ci = 0;
+    var v = envDb[k];
+    if(ch[ci]){ if(v > cd[ci]) cd[ci] = v; }
+    else { ch[ci] = 1; cd[ci] = v; }
+  }
   c.strokeStyle="#22D3EE"; c.lineWidth=1.8; c.beginPath();
   var started=false;
-  for(var i=0;i<n;i+=step){
-    var k=envIdx(i);
-    var dbv=Math.max(0,Math.min(1,(envDb[k]-DB_MIN)/(DB_MAX-DB_MIN)));
-    var age=(n-1-i)*100;               // 距当前毫秒数（每点100ms）
-    var x=w - (age/300000)*w;          // 5分钟窗口，最新贴右
-    var y=h - dbv*(h*0.92);
-    if(!started){ c.moveTo(x,y); started=true; } else c.lineTo(x,y);
-  }
-  // 末点贴右（抽稀可能漏掉最后一个点）
-  if(n){
-    var kl=envIdx(n-1);
-    var dvl=Math.max(0,Math.min(1,(envDb[kl]-DB_MIN)/(DB_MAX-DB_MIN)));
-    c.lineTo(w, h - dvl*(h*0.92));
+  for(var ci2=0; ci2<cols; ci2++){
+    if(!ch[ci2]) continue;
+    var yv=plotH - Math.max(0,Math.min(1,(cd[ci2]-DB_MIN)/(DB_MAX-DB_MIN)))*(plotH*0.95);
+    if(!started){ c.moveTo(ci2,yv); started=true; }
+    else c.lineTo(ci2,yv);
   }
   c.stroke();
-  // 悬停参考线 + 时间/分贝提示
-  if(hoverX>=0){
-    var age2=Math.max(0, (w-hoverX)/w * 300000);
-    var idx=n-1 - Math.round(age2/100);
-    idx=Math.max(0,Math.min(n-1,idx));
-    var kk=envIdx(idx), ptT=envT[kk], ptDb=envDb[kk];
-    c.strokeStyle="rgba(245,166,35,0.85)"; c.lineWidth=1.2;
-    c.beginPath(); c.moveTo(hoverX,0); c.lineTo(hoverX,h); c.stroke();
-    var dbv2=Math.max(0,Math.min(1,((ptDb)-DB_MIN)/(DB_MAX-DB_MIN)));
-    var py=h - dbv2*(h*0.92);
-    c.fillStyle="#F5A623"; c.beginPath(); c.arc(hoverX,py,3.5,0,6.283); c.fill();
-    var txt=formatFullTime(ptT)+"  "+ptDb.toFixed(1)+" dB";
-    c.font=Math.max(10,Math.round(w/55))+"px monospace";
-    var tw=c.measureText(txt).width;
-    var tx=hoverX - tw - 10; if(tx<4) tx=4; if(tx+tw>w-4) tx=w-tw-4;
-    c.fillStyle="rgba(8,12,16,0.88)"; c.fillRect(tx-4,4,tw+8,18);
-    c.fillStyle="#F5A623"; c.fillText(txt,tx,17);
+  // 悬停参考线 + 时间/分贝提示（按时间找最近的采样点，不再假设固定 100ms 间隔）
+  if(hoverX>=0 && n){
+    var targetT = nowT - Math.max(0, (w-hoverX)/w * WIN);
+    var bestK=-1, bestD=Infinity;
+    for(var j=0;j<n;j++){
+      var kj=envIdx(j), dj=Math.abs(envT[kj]-targetT);
+      if(dj<bestD){ bestD=dj; bestK=kj; }
+    }
+    if(bestK>=0){
+      var ptT=envT[bestK], ptDb=envDb[bestK];
+      c.strokeStyle="rgba(245,166,35,0.85)"; c.lineWidth=1.2;
+      c.beginPath(); c.moveTo(hoverX,0); c.lineTo(hoverX,plotH); c.stroke();
+      var dbv2=Math.max(0,Math.min(1,((ptDb)-DB_MIN)/(DB_MAX-DB_MIN)));
+      var py=plotH - dbv2*(plotH*0.95);
+      c.fillStyle="#F5A623"; c.beginPath(); c.arc(hoverX,py,3.5,0,6.283); c.fill();
+      var txt=formatFullTime(ptT)+"  "+ptDb.toFixed(1)+" dB";
+      c.font=Math.max(10,Math.round(w/55))+"px monospace";
+      var tw=c.measureText(txt).width;
+      var tx=hoverX - tw - 10; if(tx<4) tx=4; if(tx+tw>w-4) tx=w-tw-4;
+      c.fillStyle="rgba(8,12,16,0.88)"; c.fillRect(tx-4,4,tw+8,18);
+      c.fillStyle="#F5A623"; c.fillText(txt,tx,17);
+    }
   }
 }
 
 /* ---------- GPS ---------- */
 var gpsLat=null, gpsLon=null, gpsWatchId=null;
-function startGps(){
-  if(!navigator.geolocation || gpsWatchId!==null) return;
-  // macOS 无 GPS 硬件，enableHighAccuracy 请求可能挂起/超时：高精度失败自动降级标准定位，再失败 getCurrentPosition 兜底
-  var tryWatch = function(highAcc){
-    gpsWatchId = navigator.geolocation.watchPosition(
-      function(pos){ gpsLat=pos.coords.latitude; gpsLon=pos.coords.longitude; },
-      function(err){
-        console.warn("GPS失败 code=", err.code, err.message);
-        if(gpsWatchId!==null){ try{ navigator.geolocation.clearWatch(gpsWatchId); }catch(e){} gpsWatchId=null; }
-        if(highAcc){ tryWatch(false); }
-        else {
-          try{
-            navigator.geolocation.getCurrentPosition(
-              function(pos){ gpsLat=pos.coords.latitude; gpsLon=pos.coords.longitude; },
-              function(e2){ console.warn("GPS最终失败", e2); toast("⚠️定位失败：请检查系统「定位服务」已为浏览器开启并授予位置权限"); },
-              { maximumAge:60000, timeout:20000 }
-            );
-          }catch(e){ toast("⚠️定位失败：请检查系统定位权限"); }
-        }
-      },
-      { enableHighAccuracy:highAcc, maximumAge:30000, timeout:15000 }
-    );
-  };
-  tryWatch(true);
+/* 定位可靠性设计（依据本机 locationd 日志实测）：
+ * - macOS 没有 GPS 硬件，定位靠 Wi-Fi 扫描 + Apple 位置库解算，一轮扫描要 30~40 秒；
+ * - 问题根因：getCurrentPosition 是"一次性请求"，系统日志里订阅只存活 4~16 毫秒
+ *   （register → unsubscribe → stopLocation_nl），扫描还没出结果就被撤掉，只能返回 code=2；
+ *   偶尔成功的那次都是刚好命中了系统缓存的位置；
+ * - 结论：必须用 watchPosition 挂**常驻订阅**，订阅在，系统才有时间把 Wi-Fi 扫描算出来；
+ * - code=2 只是"这一轮还没算出来"，不代表定位服务关闭 → 不清订阅、不退化成单点轮询；
+ *   只有连续 90 秒毫无结果才重建一次订阅（重建会重新触发一轮扫描）。 */
+var gpsShotTimer=0, gpsRetryTimer=0, gpsFailStreak=0, gpsState="idle", gpsLastErr=null, gpsNextRetryMs=3000;
+var gpsWaitStartTs=0;         // 「还没有坐标」这一轮的开始时间，用于显示已等待秒数
+var GPS_STALL_MS=300000;      // 常驻订阅存活时的最长等待：macOS 的 Wi-Fi 定位扫描最小间隔就是 300 秒，
+                              // 90 秒重建一次等于不停催系统扫描，会被限流得更久；放到 5 分钟再看是否真死了
+var GPS_RETRY_MIN_MS=3000;    // 重建订阅的最小间隔
+var GPS_RETRY_MAX_MS=30000;   // 退避上限
+var GPS_DENY_RETRY_MS=300000; // 权限被拒后的重试间隔（改系统设置才会变，别频繁打扰）
+var GPS_WATCH_TIMEOUT_MS=15000; // watchPosition 的单次超时：不能给 0（WebKit 会把 0 当成立即超时）
+
+function gpsMobile(){ return (navigator.maxTouchPoints||0) > 1; }
+/* 网站级定位授权状态（granted/prompt/denied）：
+ * 「系统已给权限」和「本站被授权」是两件事——Safari 的站点授权在清空网站数据后会重置，
+ * 此时 WebKit 根本不会向系统定位服务发请求（locationd 里看不到 Safari 客户端），
+ * 页面只会收到 code=3 超时，很容易误判成系统定位坏了。所以把这一层状态显式读出来。 */
+var gpsPermState="unknown", gpsPermBound=false;
+function gpsQueryPermission(){
+  try{
+    if(!navigator.permissions || !navigator.permissions.query) return;
+    navigator.permissions.query({name:"geolocation"}).then(function(st){
+      if(!st) return;
+      gpsPermState = st.state || "unknown";
+      if(!gpsPermBound && st.addEventListener){
+        gpsPermBound = true;
+        st.addEventListener("change", function(){ gpsQueryPermission(); });
+      }
+      gpsRenderStatus();
+    }).catch(function(){});
+  }catch(e){}
 }
-function stopGps(){ if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
+/* 定位诊断上报：浏览器里读不到状态（Safari 禁了 AppleScript 注入），
+ * 所以把原始错误码报给服务端落 logs/gps_diag.log，排查有据可依。fire-and-forget，不阻塞。 */
+function gpsDiag(state, err){
+  try{
+    if(gpsDiag.sent && state==="fix") return;   // 成功只报一次，别刷屏
+    if(state==="fix") gpsDiag.sent = true;
+    var q = "s=" + encodeURIComponent(state)
+      + "&c=" + (err && err.code != null ? err.code : -1)
+      + "&m=" + encodeURIComponent((err && err.message) || "")
+      + "&n=" + gpsFailStreak
+      + "&p=" + encodeURIComponent(gpsPermState)
+      + "&sec=" + (window.isSecureContext === false ? 0 : 1)
+      + "&ua=" + encodeURIComponent((navigator.userAgent || "").slice(-50));
+    fetch(apiUrl("/api/gpsdiag?" + q), { cache: "no-store" }).catch(function(){});
+  }catch(e){}
+}
+/* 固定坐标兜底：?lat=..&lon=.. 打开一次即写入 localStorage，
+ * 浏览器定位长期不可用（系统 Wi-Fi 定位算不出结果）时，地址照样可用。 */
+function applyFixedGps(){
+  try{
+    var sp = new URLSearchParams(location.search || "");
+    var qlat = parseFloat(sp.get("lat")), qlon = parseFloat(sp.get("lon"));
+    if (isFinite(qlat) && isFinite(qlon) && Math.abs(qlat) <= 90 && Math.abs(qlon) <= 180){
+      localStorage.setItem("qs_fixed_gps", JSON.stringify({ lat: qlat, lon: qlon }));
+      gpsLat = qlat; gpsLon = qlon; gpsFixedCoords = true;
+      return true;
+    }
+    var s = localStorage.getItem("qs_fixed_gps");
+    if (s){
+      var o = JSON.parse(s);
+      if (o && isFinite(o.lat) && isFinite(o.lon) && Math.abs(o.lat) <= 90 && Math.abs(o.lon) <= 180){
+        gpsLat = o.lat; gpsLon = o.lon; gpsFixedCoords = true;
+        return true;
+      }
+    }
+  }catch(e){}
+  return false;
+}
+var gpsFixedCoords = false;
+function gpsStatusText(){
+  if(gpsLat!==null) return null;
+  // Safari/Chrome 只在「安全来源」下允许定位：用 http://<局域网IP>:8088 打开时必然拿不到坐标
+  if(window.isSecureContext === false)
+    return "定位不可用：当前页面是 HTTP 非安全来源（Safari 会直接禁用定位/麦克风），请改用 https:// 打开";
+  var c = gpsLastErr && gpsLastErr.code;
+  if(gpsPermState==="denied")
+    return "本站定位权限被拒绝：点地址栏左侧的「网站设置 / AA」→ 位置改为「允许」→ 刷新页面（系统权限给了不代表本站已授权）";
+  if(c===1) return "定位被拒绝：系统设置 → 隐私与安全性 → 定位服务，为浏览器打开定位后，点这里重试";
+  var w = gpsWaitStartTs ? Math.round((Date.now()-gpsWaitStartTs)/1000) : 0;
+  if(gpsPermState==="prompt" && w>=20)
+    return "浏览器还没收到本站的定位授权（已等待 "+w+" 秒）：请点地址栏左侧的「网站设置 / AA」，把「位置」设为「允许」，然后刷新页面";
+  if(gpsFailStreak>=6)
+    return "已等待 "+w+" 秒仍无定位（仍在自动重试）：macOS 只能靠 Wi-Fi 定位，请确认 Wi-Fi 已连接、页面保持在前台，点这里立即重试";
+  if(gpsState==="locating" && w<40)
+    return "正在定位…（已等待 "+w+" 秒；macOS 走 Wi-Fi 定位，通常需要 30~40 秒）";
+  return "正在重新定位…（已等待 "+w+" 秒，自动重试中，点这里立即重试）";
+}
+function gpsRenderStatus(){
+  var el=$("logLocText"); if(!el) return;
+  var t=gpsStatusText(); if(t!==null) el.textContent=t;
+}
+function gpsStopAll(){
+  if(gpsShotTimer){ clearTimeout(gpsShotTimer); gpsShotTimer=0; }
+  if(gpsWatchId!==null){ try{ navigator.geolocation.clearWatch(gpsWatchId); }catch(e){} gpsWatchId=null; }
+}
+function gpsClearRetry(){ if(gpsRetryTimer){ clearTimeout(gpsRetryTimer); gpsRetryTimer=0; } }
+function gpsOnFix(pos){
+  var lat=pos.coords.latitude, lon=pos.coords.longitude;
+  var moved = gpsLat!==null && gpsDistanceM(lat,lon,gpsLat,gpsLon) > 20;
+  gpsLat=lat; gpsLon=lon;
+  var had = gpsState==="ok";
+  gpsState="ok"; gpsLastErr=null; gpsFailStreak=0; gpsNextRetryMs=GPS_RETRY_MIN_MS;
+  gpsWaitStartTs=0; gpsCacheTs=0;
+  saveLastFix();
+  if(gpsShotTimer){ clearTimeout(gpsShotTimer); gpsShotTimer=0; }
+  gpsClearRetry();
+  renderGpsLoc(currentAddress || "");
+  refreshGpsAddress();                 // 拿到坐标立刻解析地址，不必等 1 秒轮询
+  if(moved && had) lastAddrLat=null;   // 明显移动了：下次解析不走「200m 内复用」捷径
+  gpsStartWatch();                     // 有了坐标再挂持续更新（它的报错不再影响显示）
+  gpsDiag("fix", null);
+}
+/* 常驻订阅：首次定位也走 watchPosition（不等到有坐标才挂）。
+ * timeout 必须给正数：WebKit（Safari / iOS Safari）把 0 解释成"立即超时"，
+ * 请求发出后马上以 code=3 失败（Chrome 则把 0 当"不超时"，所以只有 Chrome 正常）。
+ * 15 秒只影响错误回调时机，订阅本身不会因超时被撤销，桌面端仍能等到 Wi-Fi 解算结果。
+ * maximumAge=300000 让系统缓存的位置能立刻返回（冷启动时靠它秒出结果）。 */
+function gpsStartWatch(){
+  if(gpsWatchId!==null || !navigator.geolocation) return;
+  // 桌面（macOS 无 GPS 硬件）低精度即 Wi-Fi 定位；移动端才要高精度
+  var high = gpsMobile() && gpsFailStreak===0 && gpsLat===null;
+  try{
+    gpsWatchId = navigator.geolocation.watchPosition(gpsOnFix, gpsOnWatchError,
+      { enableHighAccuracy:high, maximumAge:300000, timeout:GPS_WATCH_TIMEOUT_MS });
+  }catch(e){ gpsWatchId=null; }
+  gpsArmStallTimer();
+}
+/* 看门狗：订阅还在但一直没有结果（Safari 常见"既不成功也不报错"）→ 90 秒后重建订阅。
+ * 90 秒 ≫ 一轮 Wi-Fi 扫描（30~40 秒），所以重建不会把正在进行的扫描打断。 */
+function gpsArmStallTimer(){
+  if(gpsShotTimer || gpsLat!==null) return;
+  gpsShotTimer = setTimeout(function(){
+    gpsShotTimer=0;
+    if(gpsLat!==null) return;
+    gpsRecreateWatch("stall");
+  }, GPS_STALL_MS);
+}
+/* 重建订阅（会重新触发一轮 Wi-Fi 扫描）：只在"90 秒仍无结果"或权限被拒后调用。
+ * 一次 code=2 绝不撤订阅，否则又回到订阅只活十几毫秒、永远等不到解算结果的老问题。 */
+function gpsRecreateWatch(reason){
+  if(gpsLat!==null) return;
+  gpsStopAll();
+  gpsFailStreak++;
+  gpsState="retrying"; gpsRenderStatus();
+  gpsDiag("err", { code:3, message:"无定位结果（"+(reason||"retry")+"）" });
+  gpsStartWatch();
+}
+function gpsScheduleRetry(ms){
+  if(gpsRetryTimer || gpsLat!==null) return;
+  gpsRetryTimer = setTimeout(function(){ gpsRetryTimer=0; if(gpsLat===null) gpsRecreateWatch("retry"); }, ms);
+}
+function gpsOnWatchError(err){
+  gpsLastErr={ code:(err&&err.code)||2, message:err&&err.message };
+  console.warn("GPS失败 code=", gpsLastErr.code, gpsLastErr.message);
+  // 把站点授权状态一起带上：日志里一眼能区分"站点没授权"和"系统/WebKit 不给位置"
+  gpsDiag("err", { code:gpsLastErr.code, message:(gpsLastErr.message||"") + " [perm=" + gpsPermState + "/loc=" + gpsState + "]" });
+  if(gpsLat!==null) return;            // 已有坐标：这次没更新上，无所谓的
+  if(gpsLastErr.code===1){
+    gpsState="denied"; gpsRenderStatus();
+    gpsScheduleRetry(GPS_DENY_RETRY_MS);
+    return;
+  }
+  // code=2/3：只是这一轮没算出结果。订阅原样保留，交给 90 秒看门狗决定是否重建
+  gpsFailStreak++;
+  gpsState="retrying"; gpsRenderStatus();
+}
+function startGps(force){
+  if(!navigator.geolocation){ gpsLastErr={code:2,message:"浏览器不支持定位"}; gpsState="failed"; gpsRenderStatus(); return; }
+  gpsQueryPermission();
+  if(force){ gpsStopAll(); gpsClearRetry(); gpsFailStreak=0; gpsLastErr=null; gpsWaitStartTs=Date.now(); }
+  // 已有坐标、但订阅掉了（切后台/休眠后常见）：直接重建订阅，别重置已有位置
+  if(gpsLat!==null){ gpsStartWatch(); return; }
+  gpsState="locating"; gpsRenderStatus();
+  if(!gpsWaitStartTs) gpsWaitStartTs=Date.now();
+  gpsStartWatch();
+}
+function stopGps(){ gpsStopAll(); gpsClearRetry(); }
 
 /* ---------- 经纬度 → 地址（后端高德逆地理编码，带浏览器缓存） ---------- */
 // 缓存版本号：后端坐标转换算法变更时递增此值，旧缓存自动失效
@@ -739,7 +960,7 @@ async function resolveAddress(lat,lon){
   var key=addrCacheKey(lat,lon);
   if(addrCache[key]) return addrCache[key];
   try{
-    var resp=await fetch("/api/regeo?lat="+lat+"&lon="+lon);
+    var resp=await fetch(apiUrl("/api/regeo?lat="+lat+"&lon="+lon));
     var data=await resp.json();
     if(data.ok && data.address){
       addrCache[key]=data.address;
@@ -750,6 +971,45 @@ async function resolveAddress(lat,lon){
     console.warn("地址解析失败，稍后自动重试",e);
   }
   return "";   // 失败不落缓存：定时器会持续重试，直到拿到地址
+}
+
+/* ---------- 指纹 + 「上次定位」缓存 ----------
+ * 同一浏览器、同一网络（服务端看到的客户端 IP 相同）视为同一场景：
+ * 刷新页面先用上次的坐标/地址直接显示，再后台校准覆盖，
+ * 避免每次刷新都去催系统定位（macOS 的 Wi-Fi 定位扫描有 5 分钟限流）。
+ */
+var gpsFp="", gpsCacheTs=0;
+function gpsFpCalc(client){
+  var tz="";
+  try{ tz=Intl.DateTimeFormat().resolvedOptions().timeZone||""; }catch(e){}
+  var raw=[navigator.userAgent||"", navigator.platform||"",
+    screen.width+"x"+screen.height, screen.colorDepth, tz,
+    navigator.language||"", navigator.hardwareConcurrency||0, client||""].join("|");
+  var h=5381;
+  for(var i=0;i<raw.length;i++){ h=((h<<5)+h+raw.charCodeAt(i))|0; }
+  return (h>>>0).toString(16);
+}
+function saveLastFix(){
+  if(gpsLat===null||gpsLon===null) return;
+  try{
+    localStorage.setItem("qs_last_fix", JSON.stringify({
+      fp:gpsFp||"", lat:gpsLat, lon:gpsLon, addr:currentAddress||"", ts:Date.now()
+    }));
+  }catch(e){}
+}
+function restoreLastFix(){
+  try{
+    var o=JSON.parse(localStorage.getItem("qs_last_fix")||"null");
+    if(!o || !isFinite(o.lat) || !isFinite(o.lon)) return false;
+    if(gpsFp && o.fp && o.fp!==gpsFp) return false;   // 换了浏览器/网络：不复用，重新定位
+    gpsLat=o.lat; gpsLon=o.lon; gpsCacheTs=o.ts||0; gpsState="cached";
+    if(o.addr){ currentAddress=o.addr; lastAddrLat=o.lat; lastAddrLon=o.lon; }
+    return true;
+  }catch(e){ return false; }
+}
+function ageText(ts){
+  var m=Math.round((Date.now()-ts)/60000);
+  return m<1 ? "刚刚" : (m+" 分钟前");
 }
 
 /* 两点间距离（米）：用于判断是否还在同一地点 */
@@ -763,13 +1023,17 @@ function gpsDistanceM(lat1,lon1,lat2,lon2){
 function renderGpsLoc(addr){
   var logLoc=$("logLocText");
   if(!logLoc) return;
-  logLoc.textContent = addr
+  // 坐标可能暂时为空（定位被重置/异步解析返回时已无坐标）：只显示地址，别抛 toFixed of null
+  if(gpsLat==null || gpsLon==null){ if(addr) logLoc.textContent=addr; return; }
+  var tail = gpsFixedCoords ? "　〔固定坐标〕" : "";
+  if(!tail && gpsState==="cached" && gpsCacheTs) tail = "　〔上次定位 "+ageText(gpsCacheTs)+"，后台校准中〕";
+  logLoc.textContent = (addr
     ? (addr+"（"+gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)+"）")
-    : (gpsLat.toFixed(5)+", "+gpsLon.toFixed(5));
+    : (gpsLat.toFixed(5)+", "+gpsLon.toFixed(5))) + tail;
 }
 
 /* ---------- GPS 地址解析：结果渲染到日志区上方的位置抬头 ---------- */
-var gpsAddrTimer=null;
+var gpsAddrTimer=null, addrFailStreak=0;
 async function refreshGpsAddress(){
   if(gpsLat==null||gpsLon==null) return;
   // 同一地点（位移 <200m）且已有地址：直接复用，不做重复逆地理编码
@@ -778,22 +1042,36 @@ async function refreshGpsAddress(){
     renderGpsLoc(currentAddress);
     return;
   }
-  var addr=await resolveAddress(gpsLat,gpsLon);
+  var lat0=gpsLat, lon0=gpsLon;
+  var addr=await resolveAddress(lat0,lon0);
+  if(gpsLat==null||gpsLon==null) return;     // await 期间坐标被重置：直接放弃这次渲染
   if(addr){
+    addrFailStreak=0;
     currentAddress=addr;
     lastAddrLat=gpsLat; lastAddrLon=gpsLon;
     renderGpsLoc(addr);
+    saveLastFix();                 // 地址也一起存，下次刷新可秒显
     return;
   }
   // 解析失败：继续由定时器重试；若已离上次解析点较远，先只显示坐标，避免显示旧地址
   var far=lastAddrLat!==null && gpsDistanceM(gpsLat,gpsLon,lastAddrLat,lastAddrLon)>=200;
   renderGpsLoc(far ? "" : currentAddress);
+  // 连续失败就把"有坐标、但地址没解析出来"这件事写清楚，
+  // 免得和"根本没拿到坐标"混在一起（两者排查方向完全不同）
+  addrFailStreak++;
+  if(addrFailStreak>=3){
+    var el=$("logLocText");
+    if(el) el.textContent = gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)
+      + "（已取得坐标，地址解析失败，自动重试中）";
+  }
 }
 function updateGpsDisplay(){
   // GPS 定位成功后启动地址解析定时器（结果显示在日志区上方，失败会自动重试直到成功）
   if(gpsLat!==null && gpsLon!==null && !gpsAddrTimer){
     gpsAddrTimer=setInterval(refreshGpsAddress,10000);
     refreshGpsAddress();
+  } else if(gpsLat===null){
+    gpsRenderStatus();   // 还没定位：持续显示「定位中 / 被拒 / 超时」的真实状态，不假装在工作
   }
 }
 
@@ -804,7 +1082,19 @@ function initAlwaysOn(){
   alwaysOnInited=true;
   // 仅启动 GPS（定位不属于音视频，页面加载即可定位）
   // 麦克风/摄像头不在此开启，等用户点「开始监测」后才开启
-  startGps();
+  // 固定坐标兜底优先：浏览器定位长期不可用时，地址/取证标记照样要能用
+  if(!applyFixedGps()) startGps();
+  else updateGpsDisplay();
+  gpsQueryPermission();          // 站点级授权状态：denied/prompt 时状态栏会直接指出来
+  // 内网直连探测 + 指纹：先拿上次的定位结果垫上，真实定位在后台继续跑
+  startNetInfo();
+  withNetInfo(function(info){
+    gpsFp = gpsFpCalc(info && info.client);
+    if(!gpsFixedCoords && gpsLat===null && restoreLastFix()){
+      renderGpsLoc(currentAddress||"");
+      if(!gpsAddrTimer) gpsAddrTimer=setInterval(refreshGpsAddress,10000);
+    }
+  });
   setInterval(updateGpsDisplay, 1000);
   updateGpsDisplay();
 }
@@ -897,12 +1187,12 @@ async function uploadSegment(blob, i){
   var ctrl = ("AbortController" in window) ? new AbortController() : null;
   var timer = ctrl ? setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, 30000) : null;
   try{
-    var qs = "/api/video/upload?deviceId="+encodeURIComponent(deviceId||"unknown")
+    var qs = apiUrl("/api/video/upload?deviceId="+encodeURIComponent(deviceId||"unknown")
       + "&tag="+encodeURIComponent(sessionTag)
       + "&start="+encodeURIComponent(sessionStartStr)
       + "&segStart="+encodeURIComponent(segStartStr)
       + "&segEnd="+encodeURIComponent(segEndStr)
-      + "&segIndex="+i;
+      + "&segIndex="+i);
     var resp = await fetch(qs,{ method:"POST", headers:{"Content-Type":"application/octet-stream"},
                                 body:blob, signal: ctrl ? ctrl.signal : undefined });
     if(!resp.ok) throw new Error("HTTP "+resp.status);
@@ -919,7 +1209,7 @@ async function uploadSegment(blob, i){
 async function doFinalize(){
   var endMs = Date.now();
   try{ // 写会话元数据（结束时间为年月日时分秒），后端据此合并 10 分钟 MP4
-    await fetch("/api/video/finalize",{method:"POST",headers:{"Content-Type":"application/json"},
+    await fetch(apiUrl("/api/video/finalize"),{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({deviceId:deviceId||"unknown", tag:sessionTag,
         start:sessionStartStr, end:formatToFile(endMs),
         startTs:sessionStartTs, endTs:endMs, segCount:segIndex,
@@ -1117,7 +1407,7 @@ function auCellHtml(r){
 async function delLog(ts){
   if(ts==null) return;
   if(!confirm("确定删除这条日志？后端对应记录也会删除。")) return;
-  try{ await fetch("/api/log/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({timeTs:String(ts)})}); }
+  try{ await fetch(apiUrl("/api/log/del"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({timeTs:String(ts)})}); }
   catch(e){ console.warn("删除后端日志失败", e); }
   logArr = logArr.filter(function(x){ return x.timeTs !== ts; });
   saveLog(); removeLogRow(ts);
@@ -1272,14 +1562,14 @@ function applyMem(){
 (function(){
   var cb=$("boostCb");
   if(!cb) return;
-  fetch("/api/config",{cache:"no-store"})
+  fetch(apiUrl("/api/config"),{cache:"no-store"})
     .then(function(r){ return r.json(); })
     .then(function(d){ if(d && d.ok && typeof d.audioBoost5x==="boolean") cb.checked=d.audioBoost5x; })
     .catch(function(){});   // 读不到就保持页面默认（开启）
   cb.addEventListener("change", function(){
     var want=cb.checked;
     cb.disabled=true;
-    fetch("/api/config",{
+    fetch(apiUrl("/api/config"),{
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({audioBoost5x:want})
@@ -1320,5 +1610,18 @@ function _onFirstInteraction(){
 document.addEventListener("click", _onFirstInteraction);
 document.addEventListener("touchstart", _onFirstInteraction);
 document.addEventListener("keydown", _onFirstInteraction);
+
+// 位置抬头可点击重试（定位失败时不用刷新页面）
+(function(){
+  var bar=$("logLocBar");
+  if(!bar) return;
+  bar.style.cursor="pointer";
+  bar.addEventListener("click", function(){
+    if(gpsLat!==null) return;              // 已有定位，点也没意义
+    gpsFailStreak=0; gpsLastErr=null; gpsState="locating";
+    gpsRenderStatus();
+    startGps(true);                        // startGps(force) 内部会撤掉旧的请求与重试定时器
+  });
+})();
 
 })();

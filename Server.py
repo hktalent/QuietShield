@@ -166,6 +166,22 @@ def reverse_geocode(lat, lon):
     return ""
 
 
+def _lan_ipv4s():
+    """本机所有可用 IPv4（排除回环/链路本地），按 en0 等物理口优先的顺序返回。"""
+    ips = []
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3).stdout
+        for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)", out):
+            ip = m.group(1)
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            if ip not in ips:
+                ips.append(ip)
+    except Exception as e:
+        print("[netinfo] 读取网卡地址失败:", e)
+    return ips
+
+
 def safe_token(s, fallback="unknown"):
     s = str(s or "")
     s = _SAFE_RE.sub("_", s)
@@ -1862,6 +1878,40 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({"ok": bool(addr), "address": addr}, ensure_ascii=False).encode("utf-8"))
 
+    def _handle_netinfo(self):
+        """GET /api/netinfo — 返回本机内网 IPv4 与调用方 IP。
+        浏览器拿不到服务器的内网地址（WebRTC 的 host candidate 已被 mDNS 混淆成 xxx.local），
+        所以由服务端自报；前端再逐个探测可达性，能直连就不绕公网。"""
+        self.send_response(200)
+        self._set_cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "ok": True,
+            "client": self.client_address[0],
+            "lan": _lan_ipv4s(),
+            "port": self.server.server_address[1],
+        }, ensure_ascii=False).encode("utf-8"))
+
+    def _handle_gps_diag(self, parsed):
+        """浏览器定位诊断上报，GET /api/gpsdiag?s=&c=&m=&sec=&n=
+        浏览器拿不到定位时无法从页面里读状态（Safari 不允许 AppleScript 注入），
+        让它把原始错误码报到服务端落文件，排查就有据可依。"""
+        try:
+            qs = parse_qs(parsed.query)
+            def g(k, n=60):
+                return (qs.get(k, [""])[0] or "")[:n]
+            line = "%s ip=%s s=%s c=%s n=%s p=%s sec=%s m=%s ua=%s" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                self.client_address[0], g("s", 12), g("c", 6), g("n", 6),
+                g("p", 10), g("sec", 3), g("m", 120), g("ua", 60))
+            path = os.path.join(LOG_DIR, "gps_diag.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print("gpsdiag failed:", e)
+        self._send_json({"ok": True})
+
     def _handle_log_list(self, parsed):
         """GET /api/log/list?date=&page=&size=&sort=&early= —— 按页取日志记录（数据库直查）"""
         q = parse_qs(parsed.query)
@@ -2178,6 +2228,12 @@ class MyHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/regeo":
             self._handle_regeo(parsed)
+            return
+        if path == "/api/netinfo":
+            self._handle_netinfo()
+            return
+        if path == "/api/gpsdiag":
+            self._handle_gps_diag(parsed)
             return
         if path == "/api/log/list":
             self._handle_log_list(parsed)

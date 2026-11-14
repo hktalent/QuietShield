@@ -38,6 +38,26 @@ else
     PY="$(command -v python3 || echo python3)"
 fi
 
+# 高德 Key 存在 ~/.zshrc 的 export QuietShield="..." 里。
+# startAllSs.sh / launchd / 非登录 shell 拉起本脚本时不会加载 ~/.zshrc，
+# 缺了这个变量 Server.py 的逆地理编码会静默返回空（页面只显示经纬度），
+# 而且没有任何报错。这里做一次兜底读取，只补缺失的变量、不覆盖已有值。
+load_env() {
+    [ -n "${QuietShield:-}" ] && return 0
+    for _envf in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile"; do
+        [ -f "$_envf" ] || continue
+        _v=$(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}QuietShield=//p' "$_envf" | tail -1 | tr -d "\"'")
+        if [ -n "$_v" ]; then
+            QuietShield="$_v"
+            export QuietShield
+            break
+        fi
+    done
+    unset _envf _v
+    return 0
+}
+load_env
+
 mkdir -p "$(dirname "$LOG_FILE")"
 
 log() {
@@ -71,6 +91,7 @@ window_exists() {
 # ---------- 服务守护 ----------
 
 supervise_server() {
+    load_env      # tmux 会话可能由 launchd/startAllSs.sh 拉起，环境变量不保证带过来
     cd "$QS_DIR" || { log "目录不存在: $QS_DIR"; return 1; }
     while :; do
         "$PY" ./Server.py
