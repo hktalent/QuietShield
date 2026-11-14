@@ -1033,7 +1033,7 @@ function renderGpsLoc(addr){
 }
 
 /* ---------- GPS 地址解析：结果渲染到日志区上方的位置抬头 ---------- */
-var gpsAddrTimer=null, addrFailStreak=0;
+var gpsAddrTimer=null, addrFailStreak=0, addrLoading=false;
 async function refreshGpsAddress(){
   if(gpsLat==null||gpsLon==null) return;
   // 同一地点（位移 <200m）且已有地址：直接复用，不做重复逆地理编码
@@ -1042,13 +1042,18 @@ async function refreshGpsAddress(){
     renderGpsLoc(currentAddress);
     return;
   }
+  // 已有一轮解析在飞就不再发起：watchPosition 每次回调都会调到这里，
+  // 并发发起会让同一地点被转换好几次（公网访问时尤其明显）
+  if(addrLoading) return;
+  addrLoading=true;
   var lat0=gpsLat, lon0=gpsLon;
+  try{
   var addr=await resolveAddress(lat0,lon0);
   if(gpsLat==null||gpsLon==null) return;     // await 期间坐标被重置：直接放弃这次渲染
   if(addr){
     addrFailStreak=0;
     currentAddress=addr;
-    lastAddrLat=gpsLat; lastAddrLon=gpsLon;
+    lastAddrLat=lat0; lastAddrLon=lon0;
     renderGpsLoc(addr);
     saveLastFix();                 // 地址也一起存，下次刷新可秒显
     return;
@@ -1064,6 +1069,7 @@ async function refreshGpsAddress(){
     if(el) el.textContent = gpsLat.toFixed(5)+", "+gpsLon.toFixed(5)
       + "（已取得坐标，地址解析失败，自动重试中）";
   }
+  }finally{ addrLoading=false; }
 }
 function updateGpsDisplay(){
   // GPS 定位成功后启动地址解析定时器（结果显示在日志区上方，失败会自动重试直到成功）

@@ -9,6 +9,7 @@ import time
 import os
 import re
 import glob
+import math
 import subprocess
 import base64
 import zipfile
@@ -144,6 +145,23 @@ def reverse_geocode(lat, lon):
     if row and row["address"]:
         _regeo_cache[key] = {"address": row["address"], "ts": row["at"] or now}
         return row["address"]
+    # 邻近复用：GPS 抖动会让 3 位小数的桶来回跳（30.6735 / 30.6736），
+    # 跨桶就变成一次新的高德请求，表现为"同一地点被反复转换"。
+    # 这里在已缓存结果里找 300m 内最近的地址直接复用。
+    best = None
+    for k, v in _regeo_cache.items():
+        if not v.get("address"):
+            continue
+        try:
+            ka, kb = k.split(",")
+            d = _rough_dist_m(lat, lon, float(ka), float(kb))
+        except Exception:
+            continue
+        if d <= 300 and (best is None or d < best[0]):
+            best = (d, v["address"])
+    if best:
+        _regeo_cache[key] = {"address": best[1], "ts": now}
+        return best[1]
     try:
         # WGS-84 → GCJ-02，再传给高德（高德只认火星坐标系）
         gcj_lng, gcj_lat = _wgs84_to_gcj02(lon, lat)
@@ -164,6 +182,13 @@ def reverse_geocode(lat, lon):
     # 没拿到地址也缓存一小段时间，避免客户端轮询时反复触发外部请求
     _regeo_cache[key] = {"address": "", "ts": now}
     return ""
+
+
+def _rough_dist_m(lat1, lon1, lat2, lon2):
+    """两点间粗略距离（米），只用于缓存邻近判断，不追求精度。"""
+    dlat = (lat2 - lat1) * 111320.0
+    dlon = (lon2 - lon1) * 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
+    return math.hypot(dlat, dlon)
 
 
 def _lan_ipv4s():
