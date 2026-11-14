@@ -432,8 +432,12 @@ async function closeAndSaveSession(){
     var startTs = overSession.startTs;
     var peak = overSession.peakDb;
     var nowTs = Date.now();
-    var durSec = ((nowTs - startTs)/1000).toFixed(1);
+    // 结束时间取「首次跌回结束线」的时刻（合并窗口内不再切断），超长切段时取当前时刻
+    var endTs = fallTs || nowTs;
+    var durSec = Math.max(0, (endTs - startTs)/1000).toFixed(1);
     resetOverSession();                        // 同步结束，防重入
+    fallTs = null;                             // 清掉本段回落时刻，避免影响下一段时长
+    trigPendingTs = 0; trigPendingPeak = 0;
     postSessionCooldownTs = nowTs;             // 事件结束进入冷却期，期内不更新背景
     var blob = takeRingBlob();                 // 同步截取
     // 立刻切段：下一段从新文件头开始，永不无限增长。停止监测时只清空缓冲不再新建录音器
@@ -474,10 +478,15 @@ async function closeAndSaveSession(){
 
 /* ===== 超标检测 ===== */
 var fallTs = null;
+var trigPendingTs = 0, trigPendingPeak = 0;   // 触发去抖：连续超线计时起点与期间峰值
 const TRIG_OFFSET = 6;
 const RELEASE_OFFSET = 3;   // 结束线 = 背景 + 3dB（低于触发线 6dB），噪声真正回落到常态附近才停
 const RELEASE_HYSTERESIS = 5;   // 白天/夜间结束线比触发线低 5dB（滞回）：常态噪声在阈值附近波动也能正常结束
-const HOLD_AFTER_FALL = 0.4;
+/* 合并窗口：低于结束线后必须连续安静这么久才真正结束本次噪声。
+ * 旧值 0.4 秒会把一段连续噪声在每次短暂回落时切断，产生大量 <2 秒的碎片记录；
+ * 3 秒内的再次超线视为同一次噪声，继续累加到当前记录（时长/峰值统一计算）。 */
+const MERGE_GAP_SEC = 3;
+const TRIG_HOLD_SEC = 0.3;    // 连续超触发线 0.3 秒才开记，避免单次采样毛刺单独成条
 const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 60 秒一段，超时切段重记（配合样本段硬上限 90 秒）
 
 function setThr(){
@@ -500,9 +509,18 @@ function processOverThreshold(currentDb){
     // 注：不再等待校准完成，检测立即生效；noiseFloorDb 初始 30dB，后台持续校准更新
     var pass = gapOn ? (currentDb > thr || currentDb > (noiseFloorDb + gapVal))
                      : (early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr));
+    // 触发去抖：连续超线 TRIG_HOLD_SEC 才开记，单采样毛刺不落盘；
+    // 起点回填到首次超线时刻，峰值取去抖窗口内的最大值，避免漏掉尖峰。
     if(pass){
-      overSession.active=true; overSession.startTs=nowTs; overSession.peakDb=currentDb;
-    }
+      if(!trigPendingTs){ trigPendingTs = nowTs; trigPendingPeak = currentDb; }
+      else if(currentDb > trigPendingPeak){ trigPendingPeak = currentDb; }
+      if((nowTs - trigPendingTs)/1000 >= TRIG_HOLD_SEC){
+        overSession.active = true;
+        overSession.startTs = trigPendingTs;
+        overSession.peakDb = Math.max(trigPendingPeak, currentDb);
+        trigPendingTs = 0; trigPendingPeak = 0;
+      }
+    } else { trigPendingTs = 0; trigPendingPeak = 0; }
   } else {
     var sessionDur = (nowTs - overSession.startTs)/1000;
     if(sessionDur >= MAX_SESSION_SEC){ closeAndSaveSession(); return; }
@@ -513,7 +531,7 @@ function processOverThreshold(currentDb){
     if(currentDb > releaseLevel){ fallTs=null; }
     else {
       if(fallTs===null) fallTs=nowTs;
-      else if((nowTs-fallTs)/1000 >= HOLD_AFTER_FALL) closeAndSaveSession();
+      else if((nowTs-fallTs)/1000 >= MERGE_GAP_SEC) closeAndSaveSession();
     }
   }
   // 录像会话内同步记录峰值
@@ -976,6 +994,7 @@ async function startMonitor(){
   initAlwaysOn();   // 确保 GPS 已启动（麦克风/摄像头由下方 ensureStream 在点击后开启）
   acquireWakeLock(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0; calArr=[]; postSessionCooldownTs=0;
+  fallTs=null; trigPendingTs=0; trigPendingPeak=0;
   var _hc=new Date().getHours(); noiseFloorCalSec = (_hc>=1 && _hc<6) ? 10 : 2;  // 凌晨 1-6 点 10s 校准，白天快速 2s
   try{
     await ensureStream();
