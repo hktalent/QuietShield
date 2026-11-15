@@ -126,9 +126,16 @@ ensure_session() {
 
 cmd_start() {
     ensure_session
-    sleep 2
-    local code
-    code=$(local_code)
+    # Server.py 起进程 + 加载证书约需 3s，只探一次会把正常的启动误判成失败，
+    # 进而让 startAllSs.sh 走"杀掉重建"分支，这里最多等约 15 秒。
+    local code i
+    i=0
+    while [ "$i" -lt 30 ]; do
+        sleep 0.5
+        i=$((i + 1))
+        code=$(local_code)
+        is_ok_code "$code" && break
+    done
     if is_ok_code "$code"; then
         log "启动完成：本地 ${LOCAL_URL} -> ${code}"
     else
