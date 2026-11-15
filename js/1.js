@@ -611,7 +611,6 @@ function liveLoop(){
 
 /* ---------- 绘制 ---------- */
 var gGauge={f:0,c:"#22D3EE",t:"--"}; // 声压计当前绘制状态，用于窗口缩放时重绘（含空闲态）
-var envColDb=null, envColHas=null;  // 包络绘制用的「像素列 → 最大 dB」scratch，每帧复用、零分配
 
 /* 画布尺寸缓存：只在「像素尺寸或 DPR 变化」时才重设 backing store。
  * 旧实现每帧都执行 canvas.width = w*dpr（等于重建一张 GPU 纹理 + 重置全部状态），
@@ -683,35 +682,28 @@ function drawScope(){
     else c.fillText("-"+(5-m)+"min", xx+2, h-4);
   }
   if(!envLen) return;
-  /* 5 分钟 dB 包络：把样本按**真实时间戳**投到像素列上，每列取该列最大值（峰值保持）。
-   * 旧实现用 i += step 抽稀，网格锚在数组下标上：数据每拍前移一格，网格相位就跟着旋转，
-   * 同一个尖峰时而画到、时而漏掉 —— 真机 step=4 时只有 1/4 的帧能画到它，视觉上就是“快速闪动”。
-   * 时间锚定后网格固定在时间轴上，尖峰只会平滑左移；每列取最大值保证窄瞬态不会被抽稀丢掉。 */
+  /* 5 分钟 dB 包络：逐样本画折线（按真实时间戳投射，亚像素精度）。
+   * 之前是「按像素列取最大值（峰值保持）」：一列约 6 个样本，样本跨列时该列的峰值会整体迁移到相邻列，
+   * 尖峰所在的列先掉下来、右边那列接上来 —— 视觉上就是波形上下跳动（每次跨界跳一次）。
+   * 现在不再按列合并，每个样本就是折线上的一个点：峰高恒等于真实 dB，横向只做连续的亚像素平移。
+   * （早先 `i += step` 抽稀导致的「尖峰闪灭」也是同一个成因，一并消失。） */
   var nowT = Date.now(), WIN = 300000;
-  var cols = Math.max(1, Math.min(4096, Math.ceil(w)));
-  if(!envColDb || envColDb.length !== cols){
-    envColDb = new Float32Array(cols);
-    envColHas = new Uint8Array(cols);
-  }
-  var cd = envColDb, ch = envColHas, n = envLen;
-  ch.fill(0);
+  var pxMs = w / WIN;
+  c.strokeStyle="#22D3EE"; c.lineWidth=1.8; c.beginPath();
+  var started=false, prevX=-1e9, n=envLen;
   for(var i=0;i<n;i++){
     var k=envIdx(i);
-    var age0 = nowT - envT[k];
-    if(age0 < 0 || age0 > WIN) continue;               // 超出 5 分钟窗口的旧点直接忽略
-    var ci = cols - 1 - Math.round(age0 / WIN * (cols - 1));
-    if(ci < 0) ci = 0;
-    var v = envDb[k];
-    if(ch[ci]){ if(v > cd[ci]) cd[ci] = v; }
-    else { ch[ci] = 1; cd[ci] = v; }
-  }
-  c.strokeStyle="#22D3EE"; c.lineWidth=1.8; c.beginPath();
-  var started=false;
-  for(var ci2=0; ci2<cols; ci2++){
-    if(!ch[ci2]) continue;
-    var yv=plotH - Math.max(0,Math.min(1,(cd[ci2]-DB_MIN)/(DB_MAX-DB_MIN)))*(plotH*0.95);
-    if(!started){ c.moveTo(ci2,yv); started=true; }
-    else c.lineTo(ci2,yv);
+    var age = nowT - envT[k];
+    if(age < 0 || age > WIN) continue;                 // 超出 5 分钟窗口的旧点直接忽略
+    var xx = w - age * pxMs;
+    if(xx < -1 || xx > w + 1) continue;
+    var yv = plotH - Math.max(0,Math.min(1,(envDb[k]-DB_MIN)/(DB_MAX-DB_MIN)))*(plotH*0.95);
+    if(!started || (xx - prevX) > 8){                  // 断档（暂停/丢样本）不拉直线，断开重画
+      c.moveTo(xx, yv); started = true;
+    } else {
+      c.lineTo(xx, yv);
+    }
+    prevX = xx;
   }
   c.stroke();
   // 悬停参考线 + 时间/分贝提示（按时间找最近的采样点，不再假设固定 100ms 间隔）
@@ -1287,6 +1279,7 @@ var startPending=false, stopPending=false;
 async function startMonitor(){
   if(running || startPending) return;
   startPending=true;
+  autoMarkDay();    // 手动或自动，只要今天启动过就记下来：避免 11:00–13:00 的兜底检查把手动停掉的采集又拉起来
   initAlwaysOn();   // 确保 GPS 已启动（麦克风/摄像头由下方 ensureStream 在点击后开启）
   acquireWakeLock(); resetOverSession();
   noiseFloorDb=30; noiseFloorSamples=0; noiseFloorSum=0; calArr=[]; postSessionCooldownTs=0;
@@ -1629,5 +1622,123 @@ document.addEventListener("keydown", _onFirstInteraction);
     startGps(true);                        // startGps(force) 内部会撤掉旧的请求与重试定时器
   });
 })();
+
+/* ---------- 每天 11:00 自动开始采集（勾选即生效，勾选状态本地持久化） ----------
+ * 纯前端方案的限制必须说清楚：采集用的是浏览器的 MediaRecorder，只有页面开着才会录。
+ * 所以这个定时器只在「页面已打开」时生效；页面没开，任何前端代码都无法启动它。
+ * Safari 会把后台标签页的 setTimeout 节流到分钟级，因此除了精确闹钟，
+ * 还有一个 60 秒的兜底检查：只要在 11:00 之后、且今天还没自动启动过，就补启动一次。
+ * 补启动窗口限制在 11:00–13:00，避免半夜开页面突然开始录制。 */
+var AUTO_HOUR = 11, AUTO_MIN = 0;
+var AUTO_CATCHUP_END_HOUR = 13;
+var AUTO_KEY = "qs_auto_1100", AUTO_LAST_KEY = "qs_auto_1100_last";
+var autoAlarmTimer = null, autoTickTimer = null, autoInFlight = false;
+
+function autoEnabled(){ try{ return localStorage.getItem(AUTO_KEY) === "1"; }catch(e){ return false; } }
+function autoSetEnabled(on){ try{ localStorage.setItem(AUTO_KEY, on ? "1" : "0"); }catch(e){} }
+function autoPad(n){ return (n < 10 ? "0" : "") + n; }
+function autoDayStr(d){ return d.getFullYear() + "-" + autoPad(d.getMonth() + 1) + "-" + autoPad(d.getDate()); }
+function autoLastDay(){ try{ return localStorage.getItem(AUTO_LAST_KEY) || ""; }catch(e){ return ""; } }
+function autoMarkDay(){ try{ localStorage.setItem(AUTO_LAST_KEY, autoDayStr(new Date())); }catch(e){} }
+function autoNextRunAt(){
+  var now = new Date();
+  var t = new Date(now.getFullYear(), now.getMonth(), now.getDate(), AUTO_HOUR, AUTO_MIN, 0, 0);
+  if (t.getTime() <= now.getTime()) t = new Date(t.getTime() + 86400000);
+  return t;
+}
+function autoHint(text, cls){
+  var el = $("autoHint"); if (!el) return;
+  el.textContent = text || "";
+  el.className = "auto-hint" + (cls ? " " + cls : "");
+}
+function autoRenderIdleHint(){
+  if (!autoEnabled()){ autoHint(""); return; }
+  var t = autoNextRunAt(), now = new Date();
+  var mins = Math.round((t - now) / 60000);
+  var when = autoDayStr(t) === autoDayStr(now) ? "今天 11:00" : "明天 11:00";
+  autoHint("已开启｜下次自动开始：" + when + "（约 " + Math.floor(mins / 60) + " 小时 " + (mins % 60) + " 分后）", "on");
+}
+async function autoTrigger(why){
+  if (autoInFlight || running || startPending) return false;
+  autoInFlight = true;
+  autoMarkDay();                                  // 先记日子，避免兜底检查重复触发
+  try{
+    await startMonitor();
+  }catch(e){
+    console.warn("自动开始失败", e);
+  }
+  autoInFlight = false;
+  if (running){
+    toast("11:00 自动开始采集已启动");
+    autoHint("已自动启动｜今天 11:00 已开始采集", "on");
+    return true;
+  }
+  // 失败最常见的原因：麦克风/摄像头权限需要一次人工点击授权（Safari 尤其严格）
+  autoHint("自动启动失败：需在页面点一次「开始监测」授权麦克风/摄像头，之后自动启动才会生效", "err");
+  toast("自动启动失败，请手动点一次「开始监测」授权");
+  return false;
+}
+/* 11:00 之后的兜底检查（每分钟一次，也用于刷新提示文案） */
+function autoTick(){
+  if (!autoEnabled()) return;
+  var now = new Date();
+  if (running || startPending || autoInFlight){ autoRenderIdleHint(); return; }
+  var h = now.getHours();
+  if (autoLastDay() !== autoDayStr(now) && h >= AUTO_HOUR && h < AUTO_CATCHUP_END_HOUR){
+    autoTrigger("tick");
+    return;
+  }
+  autoRenderIdleHint();
+}
+function autoSchedule(){
+  if (autoAlarmTimer){ clearTimeout(autoAlarmTimer); autoAlarmTimer = null; }
+  if (!autoEnabled()){ autoHint(""); return; }
+  // 精确闹钟：等到下一个 11:00:00。机器休眠/标签页被节流时由 autoTick 兜底。
+  var wait = Math.max(1000, autoNextRunAt().getTime() - Date.now());
+  autoAlarmTimer = setTimeout(function(){
+    autoAlarmTimer = null;
+    autoTrigger("alarm");
+    autoSchedule();
+  }, wait);
+  autoRenderIdleHint();
+}
+/* 勾选后立刻申请一次麦克风权限再释放：Safari 的 getUserMedia 需要一次用户手势，
+ * 提前在这个「勾选」手势里把权限拿到，11:00 时无人值守的自动启动才不会被权限挡住。
+ * 只申请音频，不点亮摄像头指示灯。 */
+function primeMicPermission(){
+  try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(false);
+    return navigator.mediaDevices.getUserMedia({
+      audio:{ echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+    }).then(function(s){
+      s.getTracks().forEach(function(t){ try{ t.stop(); }catch(e){} });
+      return true;
+    }).catch(function(){ return false; });
+  }catch(e){ return Promise.resolve(false); }
+}
+function initAutoStart(){
+  var chk = $("optAuto1100"); if (!chk) return;
+  chk.checked = autoEnabled();
+  chk.addEventListener("change", function(){
+    autoSetEnabled(chk.checked);
+    autoSchedule();
+    if (chk.checked){
+      autoHint("已开启｜页面需保持打开，11:00 前打开即可自动开始", "on");
+      primeMicPermission().then(function(ok){
+        if(!autoEnabled()) return;
+        if(ok) autoHint("麦克风权限已就绪｜页面保持打开，11:00 会自动开始采集", "on");
+        else autoHint("麦克风权限未授予：自动启动会被拦住，请先点一次「开始监测」授权", "err");
+      });
+      autoTick();            // 若此刻已过 11:00 且今天未启动，1 分钟内会补启动
+    }
+  });
+  if (autoEnabled()) autoSchedule();
+  if (!autoTickTimer) autoTickTimer = setInterval(autoTick, 60000);
+  // 标签页重新可见时立刻补一次检查（Safari 后台节流后回到前台）
+  document.addEventListener("visibilitychange", function(){
+    if (document.visibilityState === "visible" && autoEnabled()) autoTick();
+  });
+}
+initAutoStart();
 
 })();

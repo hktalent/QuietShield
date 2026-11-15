@@ -9,7 +9,7 @@
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
 <title>传感器监测台 · 声·录像</title>
-<link href="css/1.css?v=20261114e" rel="stylesheet">
+<link href="css/1.css?v=20261115c" rel="stylesheet">
 </head>
 <body>
 <div id="wrap">
@@ -64,6 +64,12 @@
       <button class="btn primary" id="btnStart">开始监测</button>
       <button class="btn red" id="btnClear">清空日志</button>
       <button class="btn green" id="btnExport">导出 HTML 报告</button>
+    </div>
+    <div class="auto-row">
+      <label title="勾选后：页面保持打开，每天 11:00 自动开始采集（无需人工点击）">
+        <input type="checkbox" id="optAuto1100"> 每天 11:00 自动开始采集
+      </label>
+      <span class="auto-hint" id="autoHint"></span>
     </div>
     <div class="loc-bar" id="logLocBar">📍 位置：<span id="logLocText">定位中…</span></div>
     <div class="log"><table>
