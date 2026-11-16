@@ -9,7 +9,7 @@
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
 <title>传感器监测台 · 声·录像</title>
-<link href="css/1.css?v=20261115c" rel="stylesheet">
+<link href="css/1.css?v=20261116a" rel="stylesheet">
 </head>
 <body>
 <div id="wrap">
@@ -64,20 +64,24 @@
       <button class="btn primary" id="btnStart">开始监测</button>
       <button class="btn red" id="btnClear">清空日志</button>
       <button class="btn green" id="btnExport">导出 HTML 报告</button>
+      <button class="btn warn" id="btnDelSel">删除选中 (0)</button>
     </div>
     <div class="auto-row">
-      <label title="勾选后：页面保持打开，每天 11:00 自动开始采集（无需人工点击）">
-        <input type="checkbox" id="optAuto1100"> 每天 11:00 自动开始采集
+      <label title="勾选后：页面保持打开，每天到这个时间自动开始采集（无需人工点击）">
+        <input type="checkbox" id="optAuto1100"> 每天
+        <input type="time" id="autoTime" value="11:00" step="60" aria-label="自动开始时间">
+        自动开始采集
       </label>
       <span class="auto-hint" id="autoHint"></span>
     </div>
     <div class="loc-bar" id="logLocBar">📍 位置：<span id="logLocText">定位中…</span></div>
     <div class="log"><table>
       <colgroup>
-        <col class="t"><col class="tag"><col class="dur"><col class="d"><col class="au"><col class="op">
+        <col class="chk"><col class="t"><col class="tag"><col class="dur"><col class="d"><col class="au"><col class="op">
       </colgroup>
       <thead>
         <tr>
+          <th class="chk-h"><input type="checkbox" id="logChkAll" title="全选当前显示的记录"></th>
           <th>触发时间</th>
           <th>标签</th>
           <th>持续秒</th>
@@ -87,7 +91,7 @@
         </tr>
       </thead>
       <tbody id="logBody">
-        <tr><td colspan="6" class="empty">尚无记录。开始监测后，声压超过阈值持续一段时间会记入日志。</td></tr>
+        <tr><td colspan="7" class="empty">尚无记录。开始监测后，声压超过阈值持续一段时间会记入日志。</td></tr>
       </tbody>
     </table></div>
   </section>

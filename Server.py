@@ -279,7 +279,8 @@ SHELL_MARK = 'name="qs-shell"'
 ASSET_VER = "20261106d"
 
 
-PAGE_SIZE = 20  # 每页最多显示条数
+PAGE_SIZE = 20           # 每页最多显示条数
+MAX_BATCH_DELETE = 200   # 单次批量删除上限（防止一次刷几万条把删除事务拖死）
 
 # 录音文件目录：logs/audio/YYYYMMDD_HHMMSS.webm（独立文件，日志库只存 URL）
 AUDIO_DIR = os.path.join(LOG_DIR, "audio")
@@ -2161,19 +2162,36 @@ class MyHandler(SimpleHTTPRequestHandler):
         self.wfile.write(resp.encode("utf-8"))
 
     def _handle_log_delete(self, parsed):
+        """删除日志记录，POST /api/log/del
+        单个：{"timeTs": "..."}；批量：{"timeTsList": ["...", "..."]}
+        批量删除同时联动删除音频文件与旧版 noise_log_*.html 里的对应行。"""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
             payload = {}
-        ts = safe_token(str(payload.get("timeTs", "")), fallback="")
+
+        ts_list = []
+        raw_list = payload.get("timeTsList")
+        if isinstance(raw_list, list):
+            for x in raw_list[:MAX_BATCH_DELETE]:
+                t = safe_token(str(x), fallback="")
+                if t and t not in ts_list:
+                    ts_list.append(t)
+        if not ts_list:
+            t = safe_token(str(payload.get("timeTs", "")), fallback="")
+            if t:
+                ts_list.append(t)
+
         removed = 0
-        if ts:
-            # 数据库里的记录
-            removed += delete_log_record(ts)
-            # 尚未迁移的旧日志 HTML 里的行
-            pat = re.compile(r'<tr\s+id="log-' + re.escape(ts) + r'"[^>]*>.*?</tr>', re.DOTALL)
+        for ts in ts_list:
+            removed += delete_log_record(ts)          # 记录 + 独立音频文件
+
+        # 尚未迁移的旧日志 HTML 里的行：一次读每个文件、一次清掉所有目标行
+        if ts_list:
+            alts = "|".join(re.escape(t) for t in ts_list[:200])
+            pat = re.compile(r'<tr\s+id="log-(?:' + alts + r')"[^>]*>.*?</tr>', re.DOTALL)
             with _io_lock:
                 for fn in os.listdir(LOG_DIR):
                     if not fn.startswith("noise_log_") or not fn.endswith(".html"):
@@ -2192,11 +2210,14 @@ class MyHandler(SimpleHTTPRequestHandler):
                         except Exception:
                             continue
                         removed += n
+
         self.send_response(200)
         self._set_cors()
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps({"ok": True, "removed": removed}).encode("utf-8"))
+        self.wfile.write(json.dumps({
+            "ok": True, "removed": removed, "count": len(ts_list)
+        }, ensure_ascii=False).encode("utf-8"))
 
     def _send_json(self, obj, code=200):
         self.send_response(code)

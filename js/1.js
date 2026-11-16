@@ -1321,6 +1321,39 @@ async function stopMonitor(){
 /* 表格最多渲染多少行：每条有录音的记录都会实例化一个 <audio>，
  * Safari 的媒体元素很重，300 行整表重绘会造成明显的卡顿与内存占用。 */
 var LOG_MAX_RENDER = 120;
+/* 批量删除的选中集合：{ "时间戳": true }。只放内存，刷新即清空——
+ * 避免"上次选中没删干净、下次进来又删一批"这种误删。 */
+var logSel = {};
+function logSelCount(){ return Object.keys(logSel).length; }
+function updateDelSelUI(){
+  var n = logSelCount();
+  var btn = $("btnDelSel");
+  if(btn){
+    btn.textContent = "删除选中 (" + n + ")";
+    btn.disabled = n === 0;
+  }
+  var all = $("logChkAll");
+  if(all){
+    var b = $("logBody");
+    var rows = b ? b.querySelectorAll("tr[data-ts]") : [];
+    var total = rows.length, on = 0;
+    for(var i=0;i<rows.length;i++){ if(rows[i].querySelector(".row-chk") && rows[i].querySelector(".row-chk").checked) on++; }
+    all.checked = total > 0 && on === total;
+    all.indeterminate = on > 0 && on < total;
+  }
+}
+function setAllRowsSelected(on){
+  var b = $("logBody");
+  if(!b) return;
+  var rows = b.querySelectorAll("tr[data-ts]");
+  for(var i=0;i<rows.length;i++){
+    var tr = rows[i], chk = tr.querySelector(".row-chk"), ts = tr.getAttribute("data-ts");
+    if(!chk) continue;
+    chk.checked = on;
+    if(on) logSel[ts] = true; else delete logSel[ts];
+  }
+  updateDelSelUI();
+}
 
 function buildLogRow(r){
   var tr=document.createElement("tr");
@@ -1329,6 +1362,7 @@ function buildLogRow(r){
   // 地址 + 经纬度作为悬停提示（行内不再单列经纬度）
   var locTip = r.address ? (r.address+"（"+r.lat+", "+r.lon+"）") : ((r.lat!=null?r.lat:"--")+", "+(r.lon!=null?r.lon:"--"));
   tr.innerHTML=
+    '<td class="chk-cell"><input type="checkbox" class="row-chk" aria-label="选择这条日志"></td>'+
     '<td title="📍 '+locTip.replace(/"/g,'&quot;')+'">'+(r.timeText||"--")+'</td>'+
     '<td>'+(r.tag||"--")+'</td>'+
     '<td>'+(r.durationSec||"N/A")+'s</td>'+
@@ -1339,6 +1373,15 @@ function buildLogRow(r){
   tr.querySelector(".au").innerHTML = auCellHtml(r);
   var btn = tr.querySelector(".del-btn");
   if(btn) btn.addEventListener("click", function(){ delLog(r.timeTs); });
+  var chk = tr.querySelector(".row-chk");
+  if(chk){
+    chk.checked = !!logSel[String(r.timeTs)];
+    chk.addEventListener("change", function(){
+      if(chk.checked) logSel[String(r.timeTs)] = true;
+      else delete logSel[String(r.timeTs)];
+      updateDelSelUI();
+    });
+  }
   return tr;
 }
 
@@ -1357,6 +1400,7 @@ function renderLog(){
     frag.appendChild(foot);
   }
   b.appendChild(frag);
+  updateDelSelUI();
 }
 
 /* 新增一条：只插入首行，不整表重绘（旧实现每条都要重建 300 行 + 300 个 <audio>） */
@@ -1401,6 +1445,36 @@ function auCellHtml(r){
   if(r && r._uploadErr) return '<span style="color:#c00;font-size:11px">上传失败</span>';
   if(r && r.audio === "") return '<span class="muted">上传中…</span>';
   return '<span class="muted">—</span>';
+}
+
+/* 批量删除：一次请求删掉全部选中项，后端同步删记录、音频文件与旧版 HTML 里的行 */
+async function delLogSelected(){
+  var tsArr = Object.keys(logSel);
+  if(!tsArr.length){ toast("先勾选要删除的日志"); return; }
+  var n = tsArr.length;
+  if(!confirm("确定删除选中的 "+n+" 条日志？\n后端对应记录与录音文件也会一起删除，不可恢复。")) return;
+  var btn = $("btnDelSel");
+  if(btn){ btn.disabled = true; btn.textContent = "删除中…"; }
+  var okResp = false, respCount = 0;
+  try{
+    var r = await fetch(apiUrl("/api/log/del"), {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ timeTsList: tsArr })
+    });
+    var j = await r.json();
+    okResp = !!(j && j.ok);
+    respCount = (j && j.count) || 0;
+  }catch(e){
+    console.warn("批量删除后端日志失败", e);
+  }
+  // 前端同步移除（后端失败也移除，避免界面与已删文件长期不一致；失败会有 toast 提示）
+  var del = {};
+  tsArr.forEach(function(t){ del[String(t)] = true; });
+  logArr = logArr.filter(function(x){ return !del[String(x.timeTs)]; });
+  logSel = {};
+  saveLog(); renderLog(); updateDelSelUI();
+  if(okResp) toast("已删除 "+n+" 条（后端清理 "+respCount+" 项）");
+  else toast("已从界面移除 "+n+" 条，但后端删除请求失败，请检查服务端");
 }
 
 async function delLog(ts){
@@ -1469,7 +1543,17 @@ var playBoostAudio = ${playBoostAudio.toString()};
 $("btnStart").addEventListener("click", async function(){
   if(running){ await stopMonitor(); toast("监测与录像已停止"); } else await startMonitor();
 });
-$("btnClear").addEventListener("click", function(){ logArr=[]; resetOverSession(); saveLog(); renderLog(); toast("日志已清空"); });
+$("btnClear").addEventListener("click", function(){
+  if(logSelCount() > 0){ logSel = {}; }
+  logArr=[]; resetOverSession(); saveLog(); renderLog(); updateDelSelUI(); toast("日志已清空");
+});
+(function(){
+  var all = $("logChkAll");
+  if(all) all.addEventListener("change", function(){ setAllRowsSelected(all.checked); });
+  var del = $("btnDelSel");
+  if(del) del.addEventListener("click", function(){ delLogSelected(); });
+  updateDelSelUI();
+})();
 $("btnExport").addEventListener("click", exportHtmlReport);
 
 // 波形图 x 轴悬停：鼠标移动时显示该位置对应的年月日 时分秒 与分贝值
@@ -1623,27 +1707,52 @@ document.addEventListener("keydown", _onFirstInteraction);
   });
 })();
 
-/* ---------- 每天 11:00 自动开始采集（勾选即生效，勾选状态本地持久化） ----------
- * 纯前端方案的限制必须说清楚：采集用的是浏览器的 MediaRecorder，只有页面开着才会录。
- * 所以这个定时器只在「页面已打开」时生效；页面没开，任何前端代码都无法启动它。
+/* ---------- 每天定时自动开始采集（时间可手工输入，默认 11:00） ----------
+ * 采集用的是浏览器的 MediaRecorder，只有页面开着才会录 —— 这个定时器只在「页面已打开」时生效。
  * Safari 会把后台标签页的 setTimeout 节流到分钟级，因此除了精确闹钟，
- * 还有一个 60 秒的兜底检查：只要在 11:00 之后、且今天还没自动启动过，就补启动一次。
- * 补启动窗口限制在 11:00–13:00，避免半夜开页面突然开始录制。 */
-var AUTO_HOUR = 11, AUTO_MIN = 0;
-var AUTO_CATCHUP_END_HOUR = 13;
-var AUTO_KEY = "qs_auto_1100", AUTO_LAST_KEY = "qs_auto_1100_last";
+ * 还有一个 60 秒的兜底检查：到点之后、且今天还没启动过就补启动一次；
+ * 补启动窗口 = 设定时刻起 2 小时内，避免半夜打开页面突然开始录制。 */
+var AUTO_KEY = "qs_auto_1100", AUTO_TIME_KEY = "qs_auto_1100_time", AUTO_LAST_KEY = "qs_auto_1100_last";
+var AUTO_DEFAULT_TIME = "11:00", AUTO_CATCHUP_MIN = 120;     // 到点后 2 小时内允许补启动
+var autoHH = 11, autoMM = 0, autoTimeBad = false;
 var autoAlarmTimer = null, autoTickTimer = null, autoInFlight = false;
 
+function autoPad(n){ return (n < 10 ? "0" : "") + n; }
+function autoFmt(){ return autoPad(autoHH) + ":" + autoPad(autoMM); }
+function autoParseTime(str){
+  var m = /^(\d{1,2}):(\d{2})$/.exec(String(str == null ? "" : str).trim());
+  if(!m) return null;
+  var h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+  if(!(h >= 0 && h <= 23 && mi >= 0 && mi <= 59)) return null;
+  return { h: h, m: mi };
+}
+/* 读取保存的时间；非法/缺失一律回落到默认 11:00 */
+function autoLoadTime(){
+  var raw = null, t = null;
+  try{ raw = localStorage.getItem(AUTO_TIME_KEY); }catch(e){}
+  t = autoParseTime(raw);
+  if(!t){ t = autoParseTime(AUTO_DEFAULT_TIME); autoTimeBad = !!(raw && raw.trim()); }
+  autoHH = t.h; autoMM = t.m;
+  var el = $("autoTime");
+  if(el) el.value = autoFmt();
+  return t;
+}
+function autoSetTime(str){
+  var t = autoParseTime(str);
+  if(!t) return false;
+  autoHH = t.h; autoMM = t.m; autoTimeBad = false;
+  try{ localStorage.setItem(AUTO_TIME_KEY, autoFmt()); }catch(e){}
+  return true;
+}
 function autoEnabled(){ try{ return localStorage.getItem(AUTO_KEY) === "1"; }catch(e){ return false; } }
 function autoSetEnabled(on){ try{ localStorage.setItem(AUTO_KEY, on ? "1" : "0"); }catch(e){} }
-function autoPad(n){ return (n < 10 ? "0" : "") + n; }
 function autoDayStr(d){ return d.getFullYear() + "-" + autoPad(d.getMonth() + 1) + "-" + autoPad(d.getDate()); }
 function autoLastDay(){ try{ return localStorage.getItem(AUTO_LAST_KEY) || ""; }catch(e){ return ""; } }
 function autoMarkDay(){ try{ localStorage.setItem(AUTO_LAST_KEY, autoDayStr(new Date())); }catch(e){} }
 function autoNextRunAt(){
   var now = new Date();
-  var t = new Date(now.getFullYear(), now.getMonth(), now.getDate(), AUTO_HOUR, AUTO_MIN, 0, 0);
-  if (t.getTime() <= now.getTime()) t = new Date(t.getTime() + 86400000);
+  var t = new Date(now.getFullYear(), now.getMonth(), now.getDate(), autoHH, autoMM, 0, 0);
+  if(t.getTime() <= now.getTime()) t = new Date(t.getTime() + 86400000);
   return t;
 }
 function autoHint(text, cls){
@@ -1652,14 +1761,15 @@ function autoHint(text, cls){
   el.className = "auto-hint" + (cls ? " " + cls : "");
 }
 function autoRenderIdleHint(){
-  if (!autoEnabled()){ autoHint(""); return; }
+  if(!autoEnabled()){ autoHint(autoTimeBad ? "时间格式无效，已回落到 " + autoFmt() : ""); return; }
+  if(autoTimeBad){ autoHint("时间格式无效，已回落到 " + autoFmt() + "｜页面需保持打开", "err"); return; }
   var t = autoNextRunAt(), now = new Date();
   var mins = Math.round((t - now) / 60000);
-  var when = autoDayStr(t) === autoDayStr(now) ? "今天 11:00" : "明天 11:00";
-  autoHint("已开启｜下次自动开始：" + when + "（约 " + Math.floor(mins / 60) + " 小时 " + (mins % 60) + " 分后）", "on");
+  var when = autoDayStr(t) === autoDayStr(now) ? "今天" : "明天";
+  autoHint("已开启｜下次自动开始：" + when + " " + autoFmt() + "（约 " + Math.floor(mins / 60) + " 小时 " + (mins % 60) + " 分后）", "on");
 }
 async function autoTrigger(why){
-  if (autoInFlight || running || startPending) return false;
+  if(autoInFlight || running || startPending) return false;
   autoInFlight = true;
   autoMarkDay();                                  // 先记日子，避免兜底检查重复触发
   try{
@@ -1668,9 +1778,9 @@ async function autoTrigger(why){
     console.warn("自动开始失败", e);
   }
   autoInFlight = false;
-  if (running){
-    toast("11:00 自动开始采集已启动");
-    autoHint("已自动启动｜今天 11:00 已开始采集", "on");
+  if(running){
+    toast(autoFmt() + " 自动开始采集已启动");
+    autoHint("已自动启动｜今天 " + autoFmt() + " 已开始采集", "on");
     return true;
   }
   // 失败最常见的原因：麦克风/摄像头权限需要一次人工点击授权（Safari 尤其严格）
@@ -1678,22 +1788,23 @@ async function autoTrigger(why){
   toast("自动启动失败，请手动点一次「开始监测」授权");
   return false;
 }
-/* 11:00 之后的兜底检查（每分钟一次，也用于刷新提示文案） */
+/* 兜底检查（每分钟一次，也用于刷新提示文案） */
 function autoTick(){
-  if (!autoEnabled()) return;
+  if(!autoEnabled()) return;
   var now = new Date();
-  if (running || startPending || autoInFlight){ autoRenderIdleHint(); return; }
-  var h = now.getHours();
-  if (autoLastDay() !== autoDayStr(now) && h >= AUTO_HOUR && h < AUTO_CATCHUP_END_HOUR){
+  if(running || startPending || autoInFlight){ autoRenderIdleHint(); return; }
+  var nowMin = now.getHours() * 60 + now.getMinutes();
+  var startMin = autoHH * 60 + autoMM;
+  if(autoLastDay() !== autoDayStr(now) && nowMin >= startMin && nowMin < startMin + AUTO_CATCHUP_MIN){
     autoTrigger("tick");
     return;
   }
   autoRenderIdleHint();
 }
 function autoSchedule(){
-  if (autoAlarmTimer){ clearTimeout(autoAlarmTimer); autoAlarmTimer = null; }
-  if (!autoEnabled()){ autoHint(""); return; }
-  // 精确闹钟：等到下一个 11:00:00。机器休眠/标签页被节流时由 autoTick 兜底。
+  if(autoAlarmTimer){ clearTimeout(autoAlarmTimer); autoAlarmTimer = null; }
+  if(!autoEnabled()){ autoRenderIdleHint(); return; }
+  // 精确闹钟：等到下一个 设定时刻（秒级 00）。机器休眠/标签页被节流时由 autoTick 兜底。
   var wait = Math.max(1000, autoNextRunAt().getTime() - Date.now());
   autoAlarmTimer = setTimeout(function(){
     autoAlarmTimer = null;
@@ -1703,7 +1814,7 @@ function autoSchedule(){
   autoRenderIdleHint();
 }
 /* 勾选后立刻申请一次麦克风权限再释放：Safari 的 getUserMedia 需要一次用户手势，
- * 提前在这个「勾选」手势里把权限拿到，11:00 时无人值守的自动启动才不会被权限挡住。
+ * 提前在这个手势里把权限拿到，到点时无人值守的自动启动才不会被权限挡住。
  * 只申请音频，不点亮摄像头指示灯。 */
 function primeMicPermission(){
   try{
@@ -1717,26 +1828,44 @@ function primeMicPermission(){
   }catch(e){ return Promise.resolve(false); }
 }
 function initAutoStart(){
-  var chk = $("optAuto1100"); if (!chk) return;
+  var chk = $("optAuto1100"); if(!chk) return;
+  autoLoadTime();                 // 先把时间填进输入框（默认 11:00）
   chk.checked = autoEnabled();
   chk.addEventListener("change", function(){
     autoSetEnabled(chk.checked);
     autoSchedule();
-    if (chk.checked){
-      autoHint("已开启｜页面需保持打开，11:00 前打开即可自动开始", "on");
+    if(chk.checked){
+      autoHint("已开启｜页面需保持打开，" + autoFmt() + " 前打开即可自动开始", "on");
       primeMicPermission().then(function(ok){
         if(!autoEnabled()) return;
-        if(ok) autoHint("麦克风权限已就绪｜页面保持打开，11:00 会自动开始采集", "on");
+        if(ok) autoHint("麦克风权限已就绪｜页面保持打开，" + autoFmt() + " 会自动开始采集", "on");
         else autoHint("麦克风权限未授予：自动启动会被拦住，请先点一次「开始监测」授权", "err");
       });
-      autoTick();            // 若此刻已过 11:00 且今天未启动，1 分钟内会补启动
+      autoTick();                 // 若此刻已到点且今天未启动，1 分钟内会补启动
     }
   });
-  if (autoEnabled()) autoSchedule();
-  if (!autoTickTimer) autoTickTimer = setInterval(autoTick, 60000);
-  // 标签页重新可见时立刻补一次检查（Safari 后台节流后回到前台）
+  var tin = $("autoTime");
+  if(tin){
+    var commit = function(){
+      var before = autoFmt();
+      if(autoSetTime(tin.value)){
+        if(tin.value !== autoFmt()) tin.value = autoFmt();   // 统一成 HH:MM
+        autoSchedule();
+        if(autoEnabled()) autoTick();
+      }else{
+        // 输入非法（空/残缺）：回落到上一次有效值，不改变调度
+        autoHint("时间格式无效（应为 HH:MM），已保持 " + before, "err");
+        tin.value = before;
+      }
+    };
+    tin.addEventListener("change", commit);
+    tin.addEventListener("blur", commit);
+    tin.addEventListener("keydown", function(e){ if(e.key === "Enter"){ commit(); tin.blur(); } });
+  }
+  if(autoEnabled()) autoSchedule();
+  if(!autoTickTimer) autoTickTimer = setInterval(autoTick, 60000);
   document.addEventListener("visibilitychange", function(){
-    if (document.visibilityState === "visible" && autoEnabled()) autoTick();
+    if(document.visibilityState === "visible" && autoEnabled()) autoTick();
   });
 }
 initAutoStart();
