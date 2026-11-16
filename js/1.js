@@ -381,6 +381,12 @@ const RING_SLICE_MS = 1000;    // 分片/采样间隔（1 秒一片）
 const RING_RESTART_MS = 10000; // 空闲时每 10 秒重建一段：触发前最多约 10 秒（比原来 2 秒更有上下文，实例数降 5 倍）
 const RING_MAX_MS = 90000;     // 单段最长 90 秒，超过立即切段，杜绝无界增长
 const RING_MAX_BYTES = 8*1024*1024;  // 单段字节硬上限（正常 90 秒 opus 约 1MB，远达不到）
+/* 样本截取窗口：事件前后各留 1 秒上下文。
+ * 环形缓冲本来会在触发前攒 ≤10 秒（每片 1 秒），短促事件（<1 秒）的录音开头全是无关静音，
+ * 听感上先播 6 秒空白再出现声音，很容易被判断成"没有声音"。
+ * 落盘时按真实时间戳只取 [事件开始-1s, 事件结束+1s]，时长字段仍用事件本身的长度。 */
+const PRE_ROLL_MS = 1000;
+const POST_ROLL_MS = 1000;
 
 function ringStart(){
   if(!window.MediaRecorder) return;   // iOS 12 Safari 无 MediaRecorder，跳过样本录音（仅监测 dB）
@@ -444,12 +450,24 @@ function stopRingRecording(){
   audioClipRecorder = null;
   ringSeg = []; ringBytes = 0;
 }
-/* 同步截取当前段（不读文件、不做 base64，避免主线程阻塞） */
-function takeRingBlob(){
+/* 同步截取当前段（不读文件、不做 base64，避免主线程阻塞）
+ * 传入 startTs/endTs 时按时间窗只取 [startTs-PRE_ROLL_MS, endTs+POST_ROLL_MS]：
+ * 每个分片约 RING_SLICE_MS，用它的结束时刻反推起点，整片都落在窗口外的直接丢掉。
+ * 分片不能从中间切开（切了会破坏 webm 流），所以前摇实际是 1.0~2.0 秒，足够听见上下文。 */
+function takeRingBlob(startTs, endTs){
   if(!ringSeg.length) return null;
-  var blobs = [], total = 0;
-  for(var k = 0; k < ringSeg.length; k++){ blobs.push(ringSeg[k].blob); total += ringSeg[k].blob.size; }
-  if(total < 200) return null;
+  var from = (startTs != null) ? (startTs - PRE_ROLL_MS) : -Infinity;
+  var to   = (endTs   != null) ? (endTs   + POST_ROLL_MS) : Infinity;
+  var blobs = [], total = 0, used = 0;
+  for(var k = 0; k < ringSeg.length; k++){
+    var seg = ringSeg[k];
+    var chunkEnd = seg.ms;
+    var chunkStart = chunkEnd - RING_SLICE_MS;
+    if(chunkEnd < from) continue;        // 整片都在前摇之前：丢掉（这就是"开头 6 秒空白"的来源）
+    if(chunkStart > to) break;           // 整片都在尾随之 后：后面的不要（数组是按时间追加的）
+    blobs.push(seg.blob); total += seg.blob.size; used++;
+  }
+  if(!used || total < 200) return null;
   var mime = (audioClipRecorder && audioClipRecorder.mimeType) || "audio/webm";
   return new Blob(blobs, {type: mime});
 }
@@ -482,7 +500,7 @@ async function closeAndSaveSession(){
     fallTs = null;                             // 清掉本段回落时刻，避免影响下一段时长
     trigPendingTs = 0; trigPendingPeak = 0;
     postSessionCooldownTs = nowTs;             // 事件结束进入冷却期，期内不更新背景
-    var blob = takeRingBlob();                 // 同步截取
+    var blob = takeRingBlob(startTs, endTs);   // 同步截取：事件前后各 1 秒上下文（显示时长仍用事件本身）
     // 立刻切段：下一段从新文件头开始，永不无限增长。停止监测时只清空缓冲不再新建录音器
     if(running) rebuildRing(); else { ringSeg = []; ringBytes = 0; }
     if(!blob || parseFloat(durSec) < MIN_RECORD_SEC || peak.toFixed(1) < 39) return;

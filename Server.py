@@ -403,6 +403,9 @@ def save_record_audio(name, data_url, mime):
         path = os.path.join(AUDIO_DIR, fname)
         with open(path, "wb") as f:
             f.write(raw)
+    # 先归一化重封装（把 WebM 时长写进文件头，Safari 才能正常播放/拖动短样本）
+    if not normalize_audio_inplace(path):
+        print(f"[音频] 归一化失败，保留原文件: {fname}")
     # 放大音量：直接覆盖刚保存的版本（不另存副本）；失败则保留原文件
     if load_settings().get("audioBoost5x"):
         if not amplify_audio_inplace(path):
@@ -474,6 +477,38 @@ _BOOST_CODECS = {
     "mp3": ("libmp3lame", "128k"),
     "wav": ("pcm_s16le", ""),
 }
+
+
+def normalize_audio_inplace(path):
+    """用 ffmpeg 重封装一遍录音，把 WebM 的时长信息写进文件头（最好努力，失败保留原文件）。
+    浏览器 MediaRecorder 产出的 WebM 是流式的，头里没有 Duration（ffprobe 显示 N/A）：
+    Safari 的 <audio> 拿不到总时长，短样本经常表现为"点了播放没声音 / 进度条不动"。
+    这里只做重封装（保留 opus 编码，不放大音量），几十毫秒级开销。"""
+    ext = str(path).rsplit(".", 1)[-1].lower()
+    codec = _BOOST_CODECS.get(ext)
+    if not FFMPEG_BIN or not codec or ext not in ("webm", "ogg"):
+        return False
+    tmp = f"{path}.norm.{ext}"
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", path, "-vn", "-c:a", codec[0], "-b:a", codec[1] or "96k", tmp]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 200:
+            with _io_lock:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return False
+        with _io_lock:
+            os.replace(tmp, path)
+        return True
+    except Exception:
+        with _io_lock:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+        return False
 
 
 def amplify_audio_inplace(path):
