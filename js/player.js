@@ -31,6 +31,18 @@ async function _loadAudioBuffer(ctx, src){
   return await _decodeAudio(ctx, await resp.arrayBuffer());
 }
 
+/* 播放起点：历史样本的文件开头常带触发前的静音（实测 0.7 秒事件的文件有 7 秒），
+ * 一按播放先听好几秒空白，很容易被当成"没有声音"。用记录里的「持续秒」反推事件位置，
+ * 直接从"事件前 1 秒"开始播；只有样本尾部的时长确实超出事件时才跳（新样本前后各 1 秒，offset≈0 不动）。 */
+function _clipStartOffset(abuf, durSec){
+  var dur = parseFloat(durSec);
+  if(!abuf || !isFinite(dur) || dur <= 0) return 0;
+  var len = abuf.duration;
+  if(!isFinite(len) || len <= 0) return 0;
+  var off = len - dur - 1;
+  return off > 4 ? off : 0;   // 只有开头明显超长静音的历史样本才跳（新样本前后各 1 秒，不跳）
+}
+
 // 兜底：某些浏览器（如 iOS Safari）无法用 WebAudio 解码 WebM/Opus，
 // 改为插入原生 <audio controls> 播放器，用户可直接点原生播放按钮，避免“静默失败”
 function _nativeFallback(src){
@@ -46,7 +58,7 @@ function _nativeFallback(src){
   }catch(e){ return null; }
 }
 
-async function playClearAudio(dataUrl){
+async function playClearAudio(dataUrl, durSec){
   if(playClearAudio._ctx){ try{playClearAudio._ctx.close();}catch(e){} playClearAudio._ctx=null; }
   var ctx=new (window.AudioContext||window.webkitAudioContext)();
   playClearAudio._ctx=ctx;
@@ -132,7 +144,7 @@ async function playClearAudio(dataUrl){
       var s0=ctx.createBufferSource(); s0.buffer=ob0;
       s0.connect(ctx.destination);
       s0.onended=function(){ if(playClearAudio._ctx){ try{playClearAudio._ctx.close();}catch(e){} playClearAudio._ctx=null; } };
-      s0.start(0);
+      s0.start(0, _clipStartOffset(ob0, durSec));
       return;
     }
     var ob=ctx.createBuffer(1, out.length, sr);
@@ -140,7 +152,7 @@ async function playClearAudio(dataUrl){
     var src=ctx.createBufferSource(); src.buffer=ob;
     src.connect(ctx.destination);
     src.onended=function(){ if(playClearAudio._ctx){ try{playClearAudio._ctx.close();}catch(e){} playClearAudio._ctx=null; } };
-    src.start(0);
+    src.start(0, _clipStartOffset(abuf, durSec));
   }catch(err){
     console.warn("降噪清晰播放失败，改用原始播放", err);
     if(playClearAudio._ctx){ try{playClearAudio._ctx.close();}catch(e){} playClearAudio._ctx=null; }
@@ -148,7 +160,7 @@ async function playClearAudio(dataUrl){
   }
 }
 
-async function playRawAudio(dataUrl){
+async function playRawAudio(dataUrl, durSec){
   if(playRawAudio._ctx){ try{playRawAudio._ctx.close();}catch(e){} playRawAudio._ctx=null; }
   var ctx=new (window.AudioContext||window.webkitAudioContext)();
   playRawAudio._ctx=ctx;
@@ -158,7 +170,7 @@ async function playRawAudio(dataUrl){
     var src=ctx.createBufferSource(); src.buffer=abuf;
     src.connect(ctx.destination);
     src.onended=function(){ if(playRawAudio._ctx){ try{playRawAudio._ctx.close();}catch(e){} playRawAudio._ctx=null; } };
-    src.start(0);
+    src.start(0, _clipStartOffset(abuf, durSec));
   }catch(err){
     console.warn("原始播放失败", err);
     if(playRawAudio._ctx){ try{playRawAudio._ctx.close();}catch(e){} playRawAudio._ctx=null; }
@@ -166,7 +178,7 @@ async function playRawAudio(dataUrl){
   }
 }
 
-async function playBoostAudio(dataUrl){
+async function playBoostAudio(dataUrl, durSec){
   if(playBoostAudio._ctx){ try{playBoostAudio._ctx.close();}catch(e){} playBoostAudio._ctx=null; }
   var ctx=new (window.AudioContext||window.webkitAudioContext)();
   playBoostAudio._ctx=ctx;
@@ -182,7 +194,7 @@ async function playBoostAudio(dataUrl){
     var src=ctx.createBufferSource(); src.buffer=abuf;
     src.connect(ctx.destination);
     src.onended=function(){ if(playBoostAudio._ctx){ try{playBoostAudio._ctx.close();}catch(e){} playBoostAudio._ctx=null; } };
-    src.start(0);
+    src.start(0, _clipStartOffset(abuf, durSec));
   }catch(err){
     console.warn("5倍音量播放失败，改用原始播放", err);
     if(playBoostAudio._ctx){ try{playBoostAudio._ctx.close();}catch(e){} playBoostAudio._ctx=null; }

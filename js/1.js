@@ -1455,10 +1455,11 @@ function removeLogRow(ts){
 function auCellHtml(r){
   if(r && r.audio && /^(\/|https?:)/.test(r.audio)){
     var u=r.audio, esc=u.replace(/"/g,'&quot;'), js=u.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    return '<audio controls preload="none" src="'+esc+'"></audio>'+
-      '<br><button type="button" class="au-btn au-ico" title="原始播放" onclick="playRawAudio(\''+js+'\')">▶</button>'+
-      '<button type="button" class="au-btn au-ico" title="5倍音量播放" onclick="playBoostAudio(\''+js+'\')">🔊</button>'+
-      '<button type="button" class="au-btn au-ico" title="降噪清晰播放" onclick="playClearAudio(\''+js+'\')">✨</button>';
+    var dur = String(r.durationSec||"").replace(/[^0-9.]/g, "");
+    return '<audio controls preload="none" data-dur="'+dur+'" src="'+esc+'"></audio>'+
+      '<br><button type="button" class="au-btn au-ico" title="原始播放" onclick="playRawAudio(\''+js+'\',\''+dur+'\')">▶</button>'+
+      '<button type="button" class="au-btn au-ico" title="5倍音量播放" onclick="playBoostAudio(\''+js+'\',\''+dur+'\')">🔊</button>'+
+      '<button type="button" class="au-btn au-ico" title="降噪清晰播放" onclick="playClearAudio(\''+js+'\',\''+dur+'\')">✨</button>';
   }
   if(r && r._uploadErr) return '<span style="color:#c00;font-size:11px">上传失败</span>';
   if(r && r.audio === "") return '<span class="muted">上传中…</span>';
@@ -1515,7 +1516,7 @@ async function exportHtmlReport(){
     var au = (rec.audio && /^(\/|https?:)/.test(rec.audio)) ? rec.audio : "";
     if(au && au.charAt(0)==="/") au = (location.origin||"") + au;   // 导出文件可能在别处打开，补全绝对地址
     var audioHtml = au
-      ? `<audio controls preload="none" style="height:28px;max-width:240px;" src="${au}">不支持播放</audio><br><button class="au-ico" title="5倍音量播放" onclick="playBoostAudio('${au}')">🔊</button><button class="au-ico" title="降噪清晰播放" onclick="playClearAudio('${au}')">✨</button>`
+      ? `<audio controls preload="none" style="height:28px;max-width:240px;" src="${au}">不支持播放</audio><br><button class="au-ico" title="5倍音量播放" onclick="playBoostAudio('${au}','${r.dur||""}')">🔊</button><button class="au-ico" title="降噪清晰播放" onclick="playClearAudio('${au}','${r.dur||""}')">✨</button>`
       : '<span style="color:#888">无录音片段</span>';
     var locTip = rec.address ? (rec.address+"（"+rec.lat+", "+rec.lon+"）") : ((rec.lat!=null?rec.lat:"--")+", "+(rec.lon!=null?rec.lon:"--"));
     rows += `<tr style="border-bottom:#ccc 1px solid;">
