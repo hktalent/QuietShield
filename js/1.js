@@ -456,6 +456,7 @@ function stopRingRecording(){
  * 分片不能从中间切开（切了会破坏 webm 流），所以前摇实际是 1.0~2.0 秒，足够听见上下文。 */
 function takeRingBlob(startTs, endTs){
   if(!ringSeg.length) return null;
+  // 警告：不要在前端按时间窗丢掉开头分片（WebM 头在首片里）。默认不传参 = 取整段。
   var from = (startTs != null) ? (startTs - PRE_ROLL_MS) : -Infinity;
   var to   = (endTs   != null) ? (endTs   + POST_ROLL_MS) : Infinity;
   var blobs = [], total = 0, used = 0;
@@ -500,7 +501,13 @@ async function closeAndSaveSession(){
     fallTs = null;                             // 清掉本段回落时刻，避免影响下一段时长
     trigPendingTs = 0; trigPendingPeak = 0;
     postSessionCooldownTs = nowTs;             // 事件结束进入冷却期，期内不更新背景
-    var blob = takeRingBlob(startTs, endTs);   // 同步截取：事件前后各 1 秒上下文（显示时长仍用事件本身）
+    // 取整段，不做前端裁剪：WebM 的 EBML 头与 OpusHead 都在最初那一片里，
+    // 丢掉前片会让整段变成"没有容器头的裸数据"，任何浏览器都放不出来。
+    // 裁剪交给服务端用 ffmpeg 做（它重写容器头），这里只把事件在片段内的偏移一起送过去。
+    var clipStart = ringSeg.length ? (ringSeg[0].ms - RING_SLICE_MS) : (startTs - RING_SLICE_MS);
+    var clipPreMs  = Math.max(0, Math.round(startTs - clipStart));
+    var clipPostMs = Math.max(0, Math.round(endTs   - clipStart));
+    var blob = takeRingBlob();                 // 同步截取整段
     // 立刻切段：下一段从新文件头开始，永不无限增长。停止监测时只清空缓冲不再新建录音器
     if(running) rebuildRing(); else { ringSeg = []; ringBytes = 0; }
     if(!blob || parseFloat(durSec) < MIN_RECORD_SEC || peak.toFixed(1) < 39) return;
@@ -526,6 +533,8 @@ async function closeAndSaveSession(){
       timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
       peakDb: peak.toFixed(1), tag: getTag(),
       audioData: audioB64,
+      clipStartMs: clipPreMs,   // 事件起点在片段内的时间（毫秒）→ 服务端裁到它前后各 1 秒
+      clipEndMs: clipPostMs,
       lat: _lat, lon: _lon,
       address: _addr   // 客户端已转换好的地址，服务端直接写入日志，不再重复解析
     }).then(function(audioUrl){

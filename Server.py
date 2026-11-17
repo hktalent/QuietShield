@@ -280,6 +280,8 @@ ASSET_VER = "20261106d"
 
 
 PAGE_SIZE = 20           # 每页最多显示条数
+PRE_ROLL_CLIP_MS = 1000     # 样本落盘时事件前保留的上下文
+POST_ROLL_CLIP_MS = 1000    # 事件后保留的上下文
 MAX_BATCH_DELETE = 200   # 单次批量删除上限（防止一次刷几万条把删除事务拖死）
 
 # 录音文件目录：logs/audio/YYYYMMDD_HHMMSS.webm（独立文件，日志库只存 URL）
@@ -380,7 +382,7 @@ def _audio_ext(mime):
     return "webm"
 
 
-def save_record_audio(name, data_url, mime):
+def save_record_audio(name, data_url, mime, clip_start_ms=None, clip_end_ms=None):
     """dataURL 录音 → logs/audio/<年月日时分秒>.<后缀> 独立文件，返回播放 URL（失败返回空串）。
     日志库只存该 URL，页面按页加载时再按需取音频。
     设置项 audioBoost5x 开启时，落盘后用放大 5 倍的版本直接覆盖原文件。"""
@@ -406,6 +408,10 @@ def save_record_audio(name, data_url, mime):
     # 先归一化重封装（把 WebM 时长写进文件头，Safari 才能正常播放/拖动短样本）
     if not normalize_audio_inplace(path):
         print(f"[音频] 归一化失败，保留原文件: {fname}")
+    # 再按客户端给的事件偏移裁到前后各 1 秒（容器头由 ffmpeg 重写，绝不在前端丢分片）
+    if clip_start_ms is not None and clip_end_ms is not None:
+        if not trim_audio_inplace(path, clip_start_ms, clip_end_ms):
+            pass   # 裁剪失败/不需要裁，保留完整片段（能播就行）
     # 放大音量：直接覆盖刚保存的版本（不另存副本）；失败则保留原文件
     if load_settings().get("audioBoost5x"):
         if not amplify_audio_inplace(path):
@@ -479,6 +485,21 @@ _BOOST_CODECS = {
 }
 
 
+def probe_duration_sec(path):
+    """用 ffprobe 读文件时长（秒）；读不到返回 None。"""
+    ffprobe = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe") if FFMPEG_BIN else None
+    if not ffprobe or not os.path.isfile(ffprobe):
+        ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        o = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", path], capture_output=True, text=True, timeout=60).stdout.strip()
+        return float(o) if o and o != "N/A" else None
+    except Exception:
+        return None
+
+
 def normalize_audio_inplace(path):
     """用 ffmpeg 重封装一遍录音，把 WebM 的时长信息写进文件头（最好努力，失败保留原文件）。
     浏览器 MediaRecorder 产出的 WebM 是流式的，头里没有 Duration（ffprobe 显示 N/A）：
@@ -494,6 +515,71 @@ def normalize_audio_inplace(path):
     try:
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
         if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 200:
+            with _io_lock:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return False
+        with _io_lock:
+            os.replace(tmp, path)
+        return True
+    except Exception:
+        with _io_lock:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+        return False
+
+
+def trim_audio_inplace(path, start_ms, end_ms):
+    """把已落盘的录音裁到 [start_ms, end_ms]（相对文件起点，毫秒），前后各留 1 秒。
+
+    为什么放在服务端做：WebM 的 EBML 头与 OpusHead 只在流的第一片里，
+    客户端按时间戳丢前片会得到"没有容器头的裸数据"（任何播放器都放不出来，实测踩过）。
+    这里用 ffmpeg 重新封装输出，容器头是完整重写的。
+    失败/窗口不合理时返回 False，原文件保持不动。"""
+    try:
+        start_ms = int(start_ms)
+        end_ms = int(end_ms)
+    except Exception:
+        return False
+    if start_ms < 0 or end_ms <= start_ms:
+        return False
+    ext = str(path).rsplit(".", 1)[-1].lower()
+    codec = _BOOST_CODECS.get(ext)
+    if not FFMPEG_BIN or not codec:
+        return False
+    dur = probe_duration_sec(path)
+    if not dur or dur <= 0:
+        return False
+    keep_start = max(0.0, (start_ms - PRE_ROLL_CLIP_MS) / 1000.0)
+    keep_end = min(dur, (end_ms + POST_ROLL_CLIP_MS) / 1000.0)
+    if keep_end - keep_start <= 0.2:
+        return False
+    if (dur - (keep_end - keep_start)) < 0.5:      # 本来就没多少可裁的
+        return False
+    tmp = f"{path}.trim.{ext}"
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", path, "-ss", f"{keep_start:.3f}", "-to", f"{keep_end:.3f}",
+           "-map", "0:a", "-vn", "-c:a", codec[0], "-b:a", codec[1] or "96k", tmp]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
+        if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 200:
+            with _io_lock:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return False
+        nd = probe_duration_sec(tmp)
+        if not nd or abs(nd - (keep_end - keep_start)) > 1.0:
+            with _io_lock:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return False
+        # 解码自检：确保裁出来的文件真的能解，避免落一个坏文件
+        chk = subprocess.run([FFMPEG_BIN, "-v", "error", "-i", tmp, "-f", "null", "-"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        if chk.returncode != 0 or (chk.stderr or b"").strip():
             with _io_lock:
                 if os.path.exists(tmp):
                     os.remove(tmp)
@@ -2148,7 +2234,8 @@ class MyHandler(SimpleHTTPRequestHandler):
             print(f"[音频] dataURL 超限 {len(audio_raw)/1048576:.1f}MB，拒绝落盘（疑似客户端样本缓冲失控）")
             audio_url = ""
         else:
-            audio_url = save_record_audio(stamp, audio_raw, mime)
+            audio_url = save_record_audio(stamp, audio_raw, mime,
+                                          payload.get("clipStartMs"), payload.get("clipEndMs"))
         lat_raw = payload.get("lat")
         lon_raw = payload.get("lon")
         # 位置直接采用客户端已转换好的地址（客户端定位后经 /api/regeo 解析并缓存），
