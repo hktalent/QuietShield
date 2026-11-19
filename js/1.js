@@ -296,7 +296,7 @@ function computeDb(){
 
 /* ===== 超标会话状态机（仅噪声，已去除磁/振快照） ===== */
 var overSession = { active:false, startTs:0, peakDb:0 };
-function resetOverSession(){ overSession.active=false; overSession.startTs=0; overSession.peakDb=0; }
+function resetOverSession(){ overSession.active=false; overSession.startTs=0; overSession.peakDb=0; if(typeof lastTrigTs !== "undefined") lastTrigTs=0; }
 
 function formatFullTime(ts){
   var d=new Date(ts), p=function(n){return ("0"+n).slice(-2);};
@@ -704,10 +704,17 @@ async function closeAndSaveSession(){
 
 /* ===== 超标检测 ===== */
 var fallTs = null;
+var lastTrigTs = 0;           // 最近一次「超过触发线」的时刻，用于兜底结束
 var trigPendingTs = 0, trigPendingPeak = 0;   // 触发去抖：连续超线计时起点与期间峰值
 const TRIG_OFFSET = 6;
 const RELEASE_OFFSET = 3;   // 结束线 = 背景 + 3dB（低于触发线 6dB），噪声真正回落到常态附近才停
 const RELEASE_HYSTERESIS = 5;   // 白天/夜间结束线比触发线低 5dB（滞回）：常态噪声在阈值附近波动也能正常结束
+/* 结束线的抖动余量：本底读数本身会在 ±3dB 上下跳（麦克风增益、系统 AGC、量化），
+ * 若只比本底高 3dB，房间稍安静一点（本底被 MIN_NOISE_FLOOR=25 钳住，读数 29~32dB），
+ * 结束线就永远达不到 → 会话一直开着，后面每一次噪声都被并进同一条。
+ * 实测事故：勾选「噪声>背景声」时本底 29dB，两拍巴掌间隔 19 秒仍被并成一条 22.5 秒记录。 */
+const RELEASE_MARGIN_DB = 8;    // 结束线至少要比本底估计高 8dB
+const SESSION_IDLE_CLOSE_SEC = 10;  // 兜底：连续这么久没有任何一拍超过触发线，直接结束本段
 /* 合并窗口：低于结束线后必须连续安静这么久才真正结束本次噪声。
  * 旧值 0.4 秒会把一段连续噪声在每次短暂回落时切断，产生大量 <2 秒的碎片记录；
  * 3 秒内的再次超线视为同一次噪声，继续累加到当前记录（时长/峰值统一计算）。 */
@@ -751,6 +758,7 @@ function processOverThreshold(currentDb){
         overSession.active = true;
         overSession.startTs = trigPendingTs;
         overSession.peakDb = Math.max(trigPendingPeak, currentDb);
+        lastTrigTs = nowTs;
         trigPendingTs = 0; trigPendingPeak = 0;
       }
     } else { trigPendingTs = 0; trigPendingPeak = 0; }
@@ -758,10 +766,20 @@ function processOverThreshold(currentDb){
     var sessionDur = (nowTs - overSession.startTs)/1000;
     if(sessionDur >= MAX_SESSION_SEC){ closeAndSaveSession(); return; }
     if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
+    if(currentDb > trigLevel) lastTrigTs = nowTs;
+    // 兜底：会话开着，但已经 SESSION_IDLE_CLOSE_SEC 秒没有任何一拍真正超过触发线，
+    // 说明这段噪声已经结束（只是结束线定得太低够不着）。时长收在最后一次超线处，不虚增。
+    if(lastTrigTs && (nowTs - lastTrigTs)/1000 >= SESSION_IDLE_CLOSE_SEC){
+      if(fallTs === null) fallTs = lastTrigTs;
+      closeAndSaveSession();
+      return;
+    }
     // 结束线：勾选背景+X时=背景+3；未勾选时 凌晨=背景+3 / 其他=固定阈值-5dB滞回。
     // 关键：结束线必须不高于触发线，否则背景抬到触发线之上时会话永远结束不了（只能等 60s 硬切）。
-    var releaseLevel = gapOn ? (noiseFloorDb + RELEASE_OFFSET)
-                             : (early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS));
+    var baseRelease = gapOn ? (noiseFloorDb + RELEASE_OFFSET)
+                            : (early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS));
+    // 再给本底抖动留余量：结束线不得低于 背景+RELEASE_MARGIN_DB，否则安静房间里永远回落不到位
+    var releaseLevel = Math.max(baseRelease, noiseFloorDb + RELEASE_MARGIN_DB);
     if(releaseLevel > trigLevel) releaseLevel = trigLevel;
     if(currentDb > releaseLevel){ fallTs=null; }
     else {
@@ -796,7 +814,14 @@ function liveLoop(){
   if(_liveLoopRunning) return;
   _liveLoopRunning=true;
   (function tick(){
-    if(soundLive){ liveDb(); if(running) streamWatchdog(); setTimeout(tick,100); }
+    if(soundLive){
+      /* 单个检测拍里任何异常（canvas/录音器/上传回调）都不能让整条 100ms 循环断掉：
+       * 旧实现在这里没有保护，一次抛错就再也不会重新排 setTimeout，
+       * 结果是"页面显示监测中、其实一个事件都不会再识别"，已发生的会话还挂在 active 上。 */
+      try{ liveDb(); }catch(err){ console.warn("[检测循环] 本拍异常，已跳过", err); }
+      if(running){ try{ streamWatchdog(); }catch(e){} }
+      setTimeout(tick,100);
+    }
     else { _liveLoopRunning=false; }
   })();
 }

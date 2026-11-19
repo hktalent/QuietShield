@@ -19,6 +19,31 @@ function _decodeAudio(ctx, buf){
   });
 }
 
+/* 统一响度整形（就地修改 abuf）：先算需要的线性增益，再逐样本 tanh 软限幅到 CEIL。
+ *   - 目标按 RMS（不是峰值）定：撞击类样本峰值早就顶到 0dBFS，按峰值归一化等于没放大；
+ *   - 软限幅而非硬削波：峰值被平滑压到 0.97，不会出现方波般的破音；
+ *   - minGainDb 给「5倍音量」兜底（至少 ×5），maxGainDb 防止安静样本被拉成噪声轰鸣。
+ * 返回实际施加的线性增益（供控制台核对）。 */
+function _loudnessBoost(abuf, targetRmsDb, maxGainDb, minGainDb){
+  var CEIL=0.97, ch, i, d, sum=0, n=0;
+  for(ch=0;ch<abuf.numberOfChannels;ch++){
+    d=abuf.getChannelData(ch);
+    for(i=0;i<d.length;i++){ sum += d[i]*d[i]; n++; }
+  }
+  var rms=Math.sqrt(sum/Math.max(1,n));
+  if(!isFinite(rms) || rms<1e-9) rms=1e-9;
+  var want=Math.pow(10, targetRmsDb/20)/rms;
+  var hi=Math.pow(10, (maxGainDb==null?26:maxGainDb)/20);
+  var lo=Math.pow(10, (minGainDb==null?0:minGainDb)/20);
+  var g=Math.min(Math.max(want, lo), hi);
+  if(!isFinite(g) || g<=0) g=lo;
+  for(ch=0;ch<abuf.numberOfChannels;ch++){
+    d=abuf.getChannelData(ch);
+    for(i=0;i<d.length;i++){ d[i]=CEIL*Math.tanh((d[i]*g)/CEIL); }
+  }
+  return g;
+}
+
 async function _loadAudioBuffer(ctx, src){
   if(!src) throw new Error("无音频数据");
   if(src.indexOf("data:")===0){
@@ -129,11 +154,8 @@ async function playClearAudio(dataUrl, durSec){
       fft(re,im,true);
       for(var k2=0;k2<N;k2++){ var ix=off5+k2; out[ix]+=re[k2]*win[k2]; nrm[ix]+=win[k2]*win[k2]; }
     }
-    var peak=1e-6;
-    for(var i2=0;i2<out.length;i2++){ if(nrm[i2]>1e-6) out[i2]/=nrm[i2]; var a=Math.abs(out[i2]); if(a>peak) peak=a; }
-    var sc=0.95/peak; if(sc>20) sc=20;   // 峰值归一化，最多放大 20 倍
-    for(var i3=0;i3<out.length;i3++) out[i3]*=sc;
-    // 极短/整段都是撞击的样本，谱减可能把有效信号当噪声减掉（听起来“没有声音”），
+    for(var i2=0;i2<out.length;i2++){ if(nrm[i2]>1e-6) out[i2]/=nrm[i2]; }
+    // 极短/整段都是撞击的样本，谱减可能把有效信号当噪声减掉（听起来"没有声音"），
     // 输出能量明显低于原始时改为直接播原始音频
     var ei=0, eo=0;
     for(var i4=0;i4<len;i4++) ei+=x[i4]*x[i4];
@@ -141,6 +163,7 @@ async function playClearAudio(dataUrl, durSec){
     if(ei>1e-9 && eo < ei*0.08){
       var ob0=ctx.createBuffer(chs, len, sr);
       for(var c0=0;c0<chs;c0++) ob0.getChannelData(c0).set(abuf.getChannelData(c0));
+      _loudnessBoost(ob0, -12, 26, 0);   // 兜底也要拉响：否则"降噪"比原始还小声，听起来像没声音
       var s0=ctx.createBufferSource(); s0.buffer=ob0;
       s0.connect(ctx.destination);
       s0.onended=function(){ if(playClearAudio._ctx){ try{playClearAudio._ctx.close();}catch(e){} playClearAudio._ctx=null; } };
@@ -149,6 +172,11 @@ async function playClearAudio(dataUrl, durSec){
     }
     var ob=ctx.createBuffer(1, out.length, sr);
     ob.getChannelData(0).set(out);
+    /* 旧实现按「峰值」归一化（sc=0.95/peak）：撞击类样本峰值本就接近满量程，
+     * 算出来 sc≈1，等于没放大；若 OLA 边缘出现一个尖峰，sc 又会被压到 0.001，
+     * 整段直接被抹成静音——这就是"降噪清晰播放不出声音"的成因。
+     * 改成按 RMS 拉响到 -12dBFS，再 tanh 软限幅，既不会没声音也不会硬削波。 */
+    _loudnessBoost(ob, -12, 26, 0);
     var src=ctx.createBufferSource(); src.buffer=ob;
     src.connect(ctx.destination);
     src.onended=function(){ if(playClearAudio._ctx){ try{playClearAudio._ctx.close();}catch(e){} playClearAudio._ctx=null; } };
@@ -185,12 +213,11 @@ async function playBoostAudio(dataUrl, durSec){
   if(ctx.state==='suspended') await ctx.resume();
   try{
     var abuf=await _loadAudioBuffer(ctx, dataUrl);
-    var peak=1e-6, c, d, i2;
-    for(c=0;c<abuf.numberOfChannels;c++){ d=abuf.getChannelData(c);
-      for(i2=0;i2<d.length;i2++){ var a=Math.abs(d[i2]); if(a>peak) peak=a; } }
-    var g=5; if(peak*g>0.95) g=0.95/peak;   // ×5 增益，限幅到峰值 0.95
-    for(c=0;c<abuf.numberOfChannels;c++){ d=abuf.getChannelData(c);
-      for(i2=0;i2<d.length;i2++) d[i2]*=g; }
+    /* 旧实现：g=5，但只要 peak*5>0.95 就令 g=0.95/peak —— 峰值本来就接近满量程的样本
+     * （如拍巴掌 0.92）算出来 g=1.03，等于「5 倍音量」只加了 0.3dB，听感上毫无变化。
+     * 现在按 RMS 拉到 -10dBFS（至少 ×5、最多 ×20），再用 tanh 软限幅压峰值，
+     * 撞击类样本能真正放大 12~20dB，且不会出现硬削波的方波声。 */
+    _loudnessBoost(abuf, -10, 26, 14);
     var src=ctx.createBufferSource(); src.buffer=abuf;
     src.connect(ctx.destination);
     src.onended=function(){ if(playBoostAudio._ctx){ try{playBoostAudio._ctx.close();}catch(e){} playBoostAudio._ctx=null; } };
