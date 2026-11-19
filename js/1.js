@@ -105,6 +105,9 @@ function ensureStream(){
 
 // ================= 声压 / 噪声检测 =================
 var audioCtx=null, analyser=null, micData=null;
+var sampleSrc=null, sampleGain=null, sampleHp=null, sampleComp=null, sampleDest=null;
+const SAMPLE_HP_FREQ = 120;   // 样本高通切除频点：滤掉低频"嗡嗡"背景（电源/电机低频），保留震楼器撞击瞬态
+const SAMPLE_GAIN = 3;        // 样本录音放大增益（原始响度偏低，放大后直接播放可听）
 var scopeBuf=[];
 
 /* 区间峰值计：主线程的 100ms 轮询在 iOS 后台会被节流到秒级，而 analyser 每次只能
@@ -160,6 +163,20 @@ function initAudioAnalysis(stream){
   src.connect(analyser);
   micData = new Float32Array(analyser.fftSize);
   initPeakMeter(src);
+  // 样本录音放大链：节点只建一次（避免分段重建反复创建节点导致累积/走样），
+  // 放大样本响度，使直接播放也能听到（原始响度偏低）
+  try{
+    sampleSrc = audioCtx.createMediaStreamSource(stream);
+    sampleHp = audioCtx.createBiquadFilter();
+    sampleHp.type="highpass"; sampleHp.frequency.value=SAMPLE_HP_FREQ; sampleHp.Q.value=0.7;
+    sampleGain = audioCtx.createGain(); sampleGain.gain.value = SAMPLE_GAIN;
+    sampleComp = audioCtx.createDynamicsCompressor();
+    // 压缩器改 limiter：只在响度到 -10dBFS 附近开始限幅防削波，不把低响度背景抬起来（避免样本播放时背景嘈杂）
+    sampleComp.threshold.value=-10; sampleComp.knee.value=4; sampleComp.ratio.value=10;
+    sampleComp.attack.value=0.003; sampleComp.release.value=0.25;
+    sampleDest = audioCtx.createMediaStreamDestination();
+    sampleSrc.connect(sampleGain); sampleGain.connect(sampleHp); sampleHp.connect(sampleComp); sampleComp.connect(sampleDest);
+  }catch(e){ sampleDest = null; }
 }
 
 /* 与 computeDb 完全同一套标定公式，保证两条路径的 dB 可比 */
@@ -519,8 +536,8 @@ function ringStart(){
   var opts = { mimeType: "audio/webm" };
   if(!MediaRecorder.isTypeSupported(opts.mimeType)) opts = { mimeType: "" };
   try{
-    // 直接录制麦克风轨道，避免增益、滤波或压缩改变样本原声
-    var recStream = new MediaStream([at]);
+    // sampleDest.stream 复用同一个 MediaStreamDestination，不每段新建 MediaStream
+    var recStream = (sampleDest && sampleDest.stream) ? sampleDest.stream : new MediaStream([at]);
     var rec = new MediaRecorder(recStream, opts);
     rec.ondataavailable = function(e){
       if(!e.data || e.data.size <= 0) return;
@@ -1482,6 +1499,9 @@ function updateVideoStat(){
 function resetAudioAnalysis(){
   if(audioCtx){ try{ audioCtx.close(); }catch(e){} }
   audioCtx=null; analyser=null; micData=null;
+  // 一并解引用样本录音链节点：否则旧 AudioContext 的节点仍被全局引用，
+  // 再次启动时若建图失败，sampleDest 会指向一条已关闭的 destination
+  sampleSrc=null; sampleGain=null; sampleHp=null; sampleComp=null; sampleDest=null;
   try{ if(peakWorklet && peakWorklet.disconnect) peakWorklet.disconnect(); }catch(e){}
   try{ if(peakProc && peakProc.disconnect) peakProc.disconnect(); }catch(e){}
   peakWorklet=null; peakWorkletSink=null; peakProc=null; peakMeterTried=false; fastPeakDb=0;
