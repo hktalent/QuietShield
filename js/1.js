@@ -71,8 +71,24 @@ function getDeviceFingerprint(){
 
 // ================= 合并流（一次 getUserMedia 同时拿音视频，避免冲突） =================
 var combinedStream = null;
+/* 媒体流是否还活着：iOS 在来电/系统中断后会把 tracks 静默变成 "ended"，
+ * 此时页面照旧显示"监测中"，但麦克风早已没有数据 —— 事件自然全部漏记。
+ * 必须显式检查 readyState，不能只看 combinedStream 是否存在。 */
+function streamAlive(s){
+  if(!s || !s.getTracks) return false;
+  var ts = s.getTracks();
+  if(!ts.length) return false;
+  for(var i=0;i<ts.length;i++){ if(ts[i].readyState !== "live") return false; }
+  return true;
+}
 function ensureStream(){
-  if(combinedStream) return Promise.resolve(combinedStream);
+  if(combinedStream && streamAlive(combinedStream)) return Promise.resolve(combinedStream);
+  if(combinedStream){                        // 轨道已结束：先彻底拆掉旧的分析链再重开
+    try{ combinedStream.getTracks().forEach(function(t){ try{ t.stop(); }catch(e){} }); }catch(e){}
+    combinedStream = null;
+    resetAudioAnalysis();
+    soundLive = false;
+  }
   return navigator.mediaDevices.getUserMedia({
     video:{ facingMode:"user", width:{ideal:1280}, height:{ideal:720} },
     audio:{ echoCancellation:false, noiseSuppression:false, autoGainControl:false }
@@ -93,6 +109,12 @@ var sampleSrc=null, sampleGain=null, sampleHp=null, sampleComp=null, sampleDest=
 const SAMPLE_HP_FREQ = 120;   // 样本高通切除频点：滤掉低频"嗡嗡"背景（电源/电机低频），保留震楼器撞击瞬态
 const SAMPLE_GAIN = 3;        // 样本录音放大增益（原始响度偏低，放大后直接播放可听）
 var scopeBuf=[];
+
+/* 区间峰值计：主线程的 100ms 轮询在 iOS 后台会被节流到秒级，而 analyser 每次只能
+ * 看到最近 46ms（fftSize=2048）——100~300ms 的撞击脉冲会在两次轮询之间整段漏掉。
+ * 这里把 RMS 峰值交给 AudioWorklet（音频线程）累计，主线程被节流也不会丢瞬态。 */
+var fastPeakDb = 0;
+var peakWorklet = null, peakWorkletSink = null, peakProc = null, peakMeterTried = false;
 
 /* 5 分钟 dB 包络：定长环形缓冲（每 100ms 一点）。
  * 旧实现用数组 push + splice 丢弃头部，每 100ms 复制 3000 个对象，
@@ -140,6 +162,7 @@ function initAudioAnalysis(stream){
   analyser.smoothingTimeConstant = 0.12;
   src.connect(analyser);
   micData = new Float32Array(analyser.fftSize);
+  initPeakMeter(src);
   // 样本录音放大链：节点只建一次（避免分段重建反复创建节点导致累积/走样），
   // 放大样本响度，使直接播放也能听到（原始响度偏低）
   try{
@@ -156,6 +179,74 @@ function initAudioAnalysis(stream){
   }catch(e){ sampleDest = null; }
 }
 
+/* 与 computeDb 完全同一套标定公式，保证两条路径的 dB 可比 */
+function rmsToDb(rms){
+  return DB_OFFSET + 20*Math.log10(rms + 1e-6) + CAL - 94;
+}
+
+/* 音频线程峰值计：worklet 里按 block 求 RMS、累计区间最大值，每 ~32ms 回传一次；
+ * 回传的是「这段时间里的最大 dB」，所以主线程哪怕被节流 5 秒，峰值也不会丢。
+ * worklet 不可用时退回 ScriptProcessor（兼容老 Safari），再不行就只靠 100ms 轮询。 */
+function initPeakMeter(src){
+  if(!audioCtx || peakMeterTried) return;
+  peakMeterTried = true;
+  var sink = null;
+  try{
+    sink = audioCtx.createGain();
+    sink.gain.value = 0;                 // 静音汇：只为让接进来的节点持续被音频线程拉取
+    sink.connect(audioCtx.destination);
+  }catch(e){ sink = null; }
+  var wl = audioCtx.audioWorklet;
+  if(wl && wl.addModule && window.AudioWorkletNode && window.Blob && window.URL && URL.createObjectURL){
+    var code =
+      'class QSPeakMeter extends AudioWorkletProcessor {' +
+      ' constructor(){ super(); this.max=-Infinity; this.n=0; }' +
+      ' process(inputs){' +
+      '  var ch = inputs[0] && inputs[0][0];' +
+      '  if(ch){ var s=0; for(var i=0;i<ch.length;i++){ s += ch[i]*ch[i]; }' +
+      '   var db = ' + DB_OFFSET + ' + 20*Math.log10(Math.sqrt(s/ch.length)+1e-6) + ' + CAL + ' - 94;' +
+      '   if(db > this.max) this.max = db; }' +
+      '  if(++this.n >= 12){ this.port.postMessage(this.max); this.max = -Infinity; this.n = 0; }' +
+      '  return true; }' +
+      '}' +
+      'registerProcessor("qs-peak-meter", QSPeakMeter);';
+    var url = null;
+    try{ url = URL.createObjectURL(new Blob([code], {type:"application/javascript"})); }catch(e){ url = null; }
+    if(url){
+      wl.addModule(url).then(function(){
+        try{
+          var node = new AudioWorkletNode(audioCtx, "qs-peak-meter");
+          node.port.onmessage = function(ev){
+            var v = ev && ev.data;
+            if(typeof v === "number" && isFinite(v) && v > fastPeakDb) fastPeakDb = v;
+          };
+          src.connect(node);
+          if(sink) node.connect(sink);
+          peakWorklet = node; peakWorkletSink = sink;
+        }catch(err){ startScriptProcessorMeter(src, sink); }
+      }).catch(function(){ startScriptProcessorMeter(src, sink); });
+      return;
+    }
+  }
+  startScriptProcessorMeter(src, sink);
+}
+
+function startScriptProcessorMeter(src, sink){
+  try{
+    if(!audioCtx || !audioCtx.createScriptProcessor) return;
+    var proc = audioCtx.createScriptProcessor(1024, 1, 1);
+    proc.onaudioprocess = function(e){
+      var d = e.inputBuffer.getChannelData(0), s = 0;
+      for(var i=0;i<d.length;i++) s += d[i]*d[i];
+      var v = rmsToDb(Math.sqrt(s/d.length));
+      if(v > fastPeakDb) fastPeakDb = v;
+    };
+    src.connect(proc);
+    if(sink) proc.connect(sink);
+    peakProc = proc;
+  }catch(err){ console.warn("峰值计启动失败，瞬态捕获退回轮询采样", err); }
+}
+
 function computeDb(){
   if(!analyser) return;
   analyser.getFloatTimeDomainData(micData);
@@ -163,10 +254,17 @@ function computeDb(){
   var dc = sum / micData.length;
   var sumSq=0; for(var j=0;j<micData.length;j++){ var v=micData[j]-dc; sumSq += v*v; }
   var rms = Math.sqrt(sumSq / micData.length);
-  var db = DB_OFFSET + 20*Math.log10(rms + 1e-6) + CAL - 94;
+  var db = rmsToDb(rms);
   if(!isFinite(db) || db < 20) db = 20;
   if(db > 120) db = 120;
+  // 取「本拍瞬时」与「上一拍以来音频线程累计峰值」中的大者做检测值：
+  // 主线程被节流时，脉冲只可能出现在累计峰值里，瞬时值会整段漏掉。
+  var _pend = fastPeakDb; fastPeakDb = 0;
+  if(!isFinite(_pend) || _pend < 20) _pend = 20;
+  if(_pend > 120) _pend = 120;
+  var detectDb = _pend > db ? _pend : db;
   DB.value = db;
+  DB.detect = detectDb;
   S.sound = Math.max(0, Math.min(1,(db-20)/70));
 
   scopeBuf = [];
@@ -174,8 +272,8 @@ function computeDb(){
   for(var k=0;k<micData.length;k+=step) scopeBuf.push(micData[k]-dc);
   if(scopeBuf.length>400) scopeBuf = scopeBuf.slice(-400);
 
-  // 5分钟 dB 包络：记录当前时间戳与 dB，供波形图呈现近 5 分钟的突发噪声与悬停取值
-  envPush(Date.now(), DB.value);
+  // 5分钟 dB 包络：用检测值（含区间峰值），节流期间漏掉的尖峰也能画出来
+  envPush(Date.now(), DB.detect);
 
   if(!overSession.active){
     if(noiseFloorSamples < noiseFloorCalSec*10){
@@ -226,6 +324,30 @@ function getTag(){
 function validAudio(a){
   return typeof a === "string" && a.length > 400 && a.indexOf("base64,") > 0;
 }
+
+/* ---------- 漏记计数 ----------
+ * 用来回答"到底探测到多少、存下来多少、丢在哪一环"。旧实现所有丢弃分支都是静默 return，
+ * 从页面和日志上都看不出有事件被吞掉，这正是这次"大量错漏"没被及时发现的原因。
+ * 计数持久化在 localStorage，可随时在控制台执行 qsDropStats() 查看。 */
+var qsDrop = {short:0, lowPeak:0, noAudio:0, upErr:0, ringStall:0};
+try{
+  var _ds = JSON.parse(localStorage.getItem("qs_drop_stats")||"{}");
+  if(_ds && typeof _ds === "object"){
+    for(var _dk in qsDrop) if(typeof _ds[_dk] === "number") qsDrop[_dk] = _ds[_dk];
+  }
+}catch(e){}
+function dropCount(k){
+  qsDrop[k] = (qsDrop[k]||0) + 1;
+  try{ localStorage.setItem("qs_drop_stats", JSON.stringify(qsDrop)); }catch(e){}
+  console.warn("[漏记] "+k+" 累计 "+qsDrop[k]);
+}
+function dropSnapshot(){
+  var o = {};
+  for(var k in qsDrop) o[k] = qsDrop[k];
+  return o;
+}
+window.qsDropStats = function(){ return dropSnapshot(); };
+window.qsDropReset = function(){ for(var k in qsDrop) qsDrop[k]=0; try{ localStorage.removeItem("qs_drop_stats"); }catch(e){} return qsDrop; };
 
 function loadLog(){
   try{ var r=JSON.parse(localStorage.getItem("sm_log")||"[]"); if(Array.isArray(r)) logArr=r; }catch(e){ logArr=[]; }
@@ -294,13 +416,29 @@ function probeLan(d){
 // 后台噪声日志推送（含设备ID，无磁/振）；成功时返回服务端落盘后的音频 URL（如 /audio/xxx.webm），失败返回空串
 const LOG_API_URL = "/api/log";
 async function pushLogToServer(record){
-  try{
-    record.deviceId = deviceId || "unknown";
-    var resp = await fetch(apiUrl(LOG_API_URL),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(record)});
-    if(!resp.ok) throw new Error("HTTP status: "+resp.status);
-    var data = await resp.json().catch(function(){ return {}; });
-    return (data && data.ok) ? (data.audio || "") : "";
-  }catch(err){ console.warn("推送日志失败，不影响本地", err); return ""; }
+  /* 重试一次：网络/服务端抖动（公网经 cloudflared）时单次失败就整条丢样本太亏。
+   * 服务端 records.ts 是主键且 INSERT OR REPLACE，重发不会产生重复记录，可安全重试。
+   * 同时加 60 秒超时，避免连接被挂死占住浏览器连接池。 */
+  record.deviceId = record.deviceId || (deviceId || "unknown");
+  var body = JSON.stringify(record);
+  for(var attempt = 0; attempt < 2; attempt++){
+    try{
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var tm = ctrl ? setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, 60000) : null;
+      var resp = await fetch(apiUrl(LOG_API_URL),{
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: body, signal: ctrl ? ctrl.signal : undefined
+      });
+      if(tm) clearTimeout(tm);
+      if(!resp.ok) throw new Error("HTTP status: "+resp.status);
+      var data = await resp.json().catch(function(){ return {}; });
+      return (data && data.ok) ? (data.audio || "") : "";
+    }catch(err){
+      console.warn("推送日志失败（第"+(attempt+1)+"次）", err);
+      if(attempt === 0) await new Promise(function(r){ setTimeout(r, 2000); });
+    }
+  }
+  return "";
 }
 
 // 为本地 logArr 中缺失音频 URL 的记录，按日期从服务端回填（最多最近 14 天）。
@@ -376,7 +514,6 @@ var ringSeg = [];              // 当前录音段的片数组（每项 {db, blob
 var ringBytes = 0;             // 当前段累计字节
 var ringT0 = 0;                // 当前段开录时间戳
 var ringTimer = null;
-var ringCapWarned = false;
 const RING_SLICE_MS = 1000;    // 分片/采样间隔（1 秒一片）
 const RING_RESTART_MS = 10000; // 空闲时每 10 秒重建一段：触发前最多约 10 秒（比原来 2 秒更有上下文，实例数降 5 倍）
 const RING_MAX_MS = 90000;     // 单段最长 90 秒，超过立即切段，杜绝无界增长
@@ -394,7 +531,8 @@ function ringStart(){
   var at = combinedStream.getAudioTracks()[0];
   if(!at) return;
   var buf = [];                // 本 recorder 独立片数组（旧段收尾不会污染新段）
-  ringSeg = buf; ringBytes = 0; ringT0 = Date.now(); ringCapWarned = false;
+  var segBytes = 0, segWarned = false;   // 字节计数按段独立，避免新旧段串账
+  ringSeg = buf; ringBytes = 0; ringT0 = Date.now();
   var opts = { mimeType: "audio/webm" };
   if(!MediaRecorder.isTypeSupported(opts.mimeType)) opts = { mimeType: "" };
   try{
@@ -403,26 +541,27 @@ function ringStart(){
     var rec = new MediaRecorder(recStream, opts);
     rec.ondataavailable = function(e){
       if(!e.data || e.data.size <= 0) return;
-      if(ringBytes + e.data.size > RING_MAX_BYTES){
-        if(!ringCapWarned){ ringCapWarned = true; console.warn("噪声样本单段超字节上限，已丢弃后续分片"); }
+      if(segBytes + e.data.size > RING_MAX_BYTES){
+        if(!segWarned){ segWarned = true; console.warn("噪声样本单段超字节上限，已丢弃后续分片"); }
         return;
       }
       buf.push({ db: DB.value, blob: e.data, ms: Date.now() });
-      ringBytes += e.data.size;
+      segBytes += e.data.size;
+      if(buf === ringSeg) ringBytes = segBytes;   // 只有当前段才更新全局计数
     };
     rec.start(RING_SLICE_MS);
     audioClipRecorder = rec;
   }catch(err){ audioClipRecorder = null; console.warn("噪声样本录音启动失败", err); }
 }
-/* 切段：先解引用旧实例再开新段。旧的实现把 ringStart 挂在 old.onstop 上，
- * 一旦 stop 与 onstop 之间又被 ensureRing 触发，就会叠出多条录音器（互相污染 buf）。 */
+/* 切段：先开新段、再停旧段。
+ * 旧实现「先 stop 再 start」并且把 ondataavailable 置空，等于每次切段都丢掉旧段最后
+ * ≤1 秒的音频（10 秒切一次 → 一小时丢 6 分钟）；撞击正好落在窗口里时就整段没了。 */
 function rebuildRing(){
   var old = audioClipRecorder;
-  audioClipRecorder = null;
-  if(old){
-    try{ old.ondataavailable = null; if(old.state === "recording") old.stop(); }catch(e){}
-  }
   ringStart();
+  if(old && old !== audioClipRecorder){
+    try{ if(old.state === "recording") old.stop(); }catch(e){}
+  }
 }
 function ensureRing(){
   if(!audioClipRecorder){ ringStart(); return; }
@@ -433,6 +572,9 @@ function ensureRing(){
     if(age >= RING_MAX_MS) closeAndSaveSession();
     return;
   }
+  // 新段开了 3 秒还一片都没收到：录音器/音频链已经僵死（AudioContext 静默、destination 断流），
+  // 重建一次尝试恢复，并计入漏记统计，避免"看起来在录、其实一直是空段"。
+  if(!ringSeg.length && age >= 3000){ dropCount("ringStall"); rebuildRing(); return; }
   if(age >= RING_RESTART_MS) rebuildRing();
 }
 function startRingRecording(){
@@ -505,15 +647,26 @@ async function closeAndSaveSession(){
     // 丢掉前片会让整段变成"没有容器头的裸数据"，任何浏览器都放不出来。
     // 裁剪交给服务端用 ffmpeg 做（它重写容器头），这里只把事件在片段内的偏移一起送过去。
     var clipStart = ringSeg.length ? (ringSeg[0].ms - RING_SLICE_MS) : (startTs - RING_SLICE_MS);
+    var blob = takeRingBlob();                 // 同步截取整段
+    if(!blob && running){
+      /* 事件正好落在新段开头的第一片还没落袋的 1 秒内（每 10 秒切段，约 10% 命中的情况），
+       * 此时缓冲是空的。等一片（≤1.1 秒）再取：声音就在这一片里，不能直接判"无样本"。 */
+      await new Promise(function(res){ setTimeout(res, 1100); });
+      if(ringSeg.length) clipStart = ringSeg[0].ms - RING_SLICE_MS;
+      blob = takeRingBlob();
+    }
     var clipPreMs  = Math.max(0, Math.round(startTs - clipStart));
     var clipPostMs = Math.max(0, Math.round(endTs   - clipStart));
-    var blob = takeRingBlob();                 // 同步截取整段
     // 立刻切段：下一段从新文件头开始，永不无限增长。停止监测时只清空缓冲不再新建录音器
     if(running) rebuildRing(); else { ringSeg = []; ringBytes = 0; }
-    if(!blob || parseFloat(durSec) < MIN_RECORD_SEC || peak.toFixed(1) < 39) return;
-    var audioB64 = await blobToDataUrl(blob);
-    // 样本无效/为空、持续过短、或峰值太小 → 不记录也不上传（避免无效落盘），直接结束本段
-    if(!validAudio(audioB64)) return;
+    /* 这里是"错漏"最大的一处：旧实现只要样本取不到（blob 为空 / base64 无效）就整条 return，
+     * 事件在日志里彻底消失，事后完全看不出"探测到了但没存下来"。
+     * 现在只在时长过短、峰值过低时丢弃；样本缺失照样入库，只是 audio 为空。 */
+    if(parseFloat(durSec) < MIN_RECORD_SEC){ dropCount("short"); return; }
+    if(!isFinite(peak) || peak < MIN_RECORD_PEAK){ dropCount("lowPeak"); return; }
+    var audioB64 = blob ? await blobToDataUrl(blob) : null;
+    var hasAudio = validAudio(audioB64);
+    if(!hasAudio){ audioB64 = ""; dropCount("noAudio"); }
     var fullTimeStr = formatFullTime(startTs);
     var _lat = gpsLat!==null ? gpsLat.toFixed(6):null;
     var _lon = gpsLon!==null ? gpsLon.toFixed(6):null;
@@ -523,7 +676,7 @@ async function closeAndSaveSession(){
     var rec = {
       timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
       peakDb: peak.toFixed(1), tag: getTag(),
-      lat: _lat, lon: _lon, address: _addr, audio: ""
+      lat: _lat, lon: _lon, address: _addr, audio: "", _noAudio: !hasAudio
     };
     logArr.unshift(rec);
     if(logArr.length>300) logArr.length=300;
@@ -533,13 +686,16 @@ async function closeAndSaveSession(){
       timeText: fullTimeStr, timeTs: startTs, durationSec: durSec,
       peakDb: peak.toFixed(1), tag: getTag(),
       audioData: audioB64,
+      audioMissing: !hasAudio,   // 样本缺失标记：服务端照常入库，前端明确显示"无样本"
       clipStartMs: clipPreMs,   // 事件起点在片段内的时间（毫秒）→ 服务端裁到它前后各 1 秒
       clipEndMs: clipPostMs,
+      diag: dropSnapshot(),      // 漏记计数一起上报，便于核对"探测到多少、存下多少"
       lat: _lat, lon: _lon,
       address: _addr   // 客户端已转换好的地址，服务端直接写入日志，不再重复解析
     }).then(function(audioUrl){
-      if(audioUrl){ rec.audio = audioUrl; rec._uploadErr = false; }
-      else { rec._uploadErr = true; }
+      if(audioUrl){ rec.audio = audioUrl; rec._uploadErr = false; rec._noAudio = false; }
+      else if(!hasAudio){ rec._uploadErr = false; rec._noAudio = true; }  // 本来就没样本：不算上传失败
+      else { rec._uploadErr = true; dropCount("upErr"); }
       saveLog(); updateLogRowAudio(rec);
     });
   }catch(e){ console.warn("保存噪声记录失败", e); }
@@ -556,7 +712,12 @@ const RELEASE_HYSTERESIS = 5;   // 白天/夜间结束线比触发线低 5dB（�
  * 旧值 0.4 秒会把一段连续噪声在每次短暂回落时切断，产生大量 <2 秒的碎片记录；
  * 3 秒内的再次超线视为同一次噪声，继续累加到当前记录（时长/峰值统一计算）。 */
 const MERGE_GAP_SEC = 3;
-const TRIG_HOLD_SEC = 0.3;    // 连续超触发线 0.3 秒才开记，避免单次采样毛刺单独成条
+const TRIG_HOLD_SEC = 0.15;   // 连续超触发线 0.15 秒（2 拍）才开记：检测值已是区间峰值，不需要 3 拍去抖
+/* 单点尖峰直接开记：震楼器/撞击类噪声只有 100~300ms，靠"连续 0.3 秒超线"永远等不到
+ * （100ms 轮询 + 46ms 测量窗，一次撞击最多命中 2~3 拍，实测 100% 漏记）。
+ * 只要一拍就高出触发线 IMPULSE_MARGIN_DB，就当作瞬态事件立即开记。 */
+const IMPULSE_MARGIN_DB = 3;
+const MIN_RECORD_PEAK = 32;   // 只挡明显不是噪声的垃圾样本；旧值 39 会切掉一大批真实轻撞击
 const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 60 秒一段，超时切段重记（配合样本段硬上限 90 秒）
 
 function setThr(){
@@ -571,20 +732,22 @@ function processOverThreshold(currentDb){
   // 每次都读取开关状态，确保会话进行中切换也能正确判定结束线
   var gapOn = !!($("dbGapCb") && $("dbGapCb").checked);
   var gapVal = gapOn ? (parseFloat($("dbGapIn").value)||6) : 0;
+  setThr();   // 每拍都刷新：跨时段（白天/夜间切换）也能立即按新阈值判定
+  // 触发线显式化：固定阈值与「背景+X」取较小者（与原 OR 逻辑完全等价），
+  // 后面的瞬时尖峰线和结束线都以它为基准，避免三处各算一套互相打架。
+  var trigLevel = gapOn ? Math.min(thr, noiseFloorDb + gapVal)
+                        : (early ? Math.min(thr, triggerLevel) : thr);
   if(!overSession.active){
     fallTs = null;
-    setThr();
-    // 触发：勾选"背景声+X dB记录"→噪声>背景声+XdB 或 超固定阈值，任一即触发；
-    //      未勾选→维持原逻辑（凌晨=45或背景+6；其他时段=固定阈值）
-    // 注：不再等待校准完成，检测立即生效；noiseFloorDb 初始 30dB，后台持续校准更新
-    var pass = gapOn ? (currentDb > thr || currentDb > (noiseFloorDb + gapVal))
-                     : (early ? (currentDb > thr || currentDb > triggerLevel) : (currentDb > thr));
-    // 触发去抖：连续超线 TRIG_HOLD_SEC 才开记，单采样毛刺不落盘；
-    // 起点回填到首次超线时刻，峰值取去抖窗口内的最大值，避免漏掉尖峰。
+    var impulseLevel = trigLevel + IMPULSE_MARGIN_DB;
+    var pass = currentDb > trigLevel;
+    var impulse = currentDb >= impulseLevel;
+    // 触发去抖：连续超线 TRIG_HOLD_SEC 才开记；但单拍瞬态尖峰（≥触发线+IMPULSE_MARGIN_DB）立即开记，
+    // 起点回填到首次超线时刻，峰值取去抖窗口内的最大值。
     if(pass){
       if(!trigPendingTs){ trigPendingTs = nowTs; trigPendingPeak = currentDb; }
       else if(currentDb > trigPendingPeak){ trigPendingPeak = currentDb; }
-      if((nowTs - trigPendingTs)/1000 >= TRIG_HOLD_SEC){
+      if(impulse || (nowTs - trigPendingTs)/1000 >= TRIG_HOLD_SEC){
         overSession.active = true;
         overSession.startTs = trigPendingTs;
         overSession.peakDb = Math.max(trigPendingPeak, currentDb);
@@ -595,9 +758,11 @@ function processOverThreshold(currentDb){
     var sessionDur = (nowTs - overSession.startTs)/1000;
     if(sessionDur >= MAX_SESSION_SEC){ closeAndSaveSession(); return; }
     if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
-    // 结束线：勾选背景+X时=背景+3；未勾选时 凌晨=背景+3 / 其他=固定阈值-5dB滞回
+    // 结束线：勾选背景+X时=背景+3；未勾选时 凌晨=背景+3 / 其他=固定阈值-5dB滞回。
+    // 关键：结束线必须不高于触发线，否则背景抬到触发线之上时会话永远结束不了（只能等 60s 硬切）。
     var releaseLevel = gapOn ? (noiseFloorDb + RELEASE_OFFSET)
                              : (early ? (noiseFloorDb + RELEASE_OFFSET) : (thr - RELEASE_HYSTERESIS));
+    if(releaseLevel > trigLevel) releaseLevel = trigLevel;
     if(currentDb > releaseLevel){ fallTs=null; }
     else {
       if(fallTs===null) fallTs=nowTs;
@@ -624,16 +789,65 @@ function liveDb(){
     else { st.textContent="正常"; st.className="gstate"; }
   }
   drawScope();
-  if(running) processOverThreshold(db);   // 仅在监测中做阈值检测与日志记录
+  if(running) processOverThreshold(DB.detect != null ? DB.detect : db);   // 用含区间峰值的检测值，瞬态不漏
 }
 var _liveLoopRunning=false;
 function liveLoop(){
   if(_liveLoopRunning) return;
   _liveLoopRunning=true;
   (function tick(){
-    if(soundLive){ liveDb(); setTimeout(tick,100); }
+    if(soundLive){ liveDb(); if(running) streamWatchdog(); setTimeout(tick,100); }
     else { _liveLoopRunning=false; }
   })();
+}
+
+/* 采集链自愈：AudioContext 被系统挂起（锁屏/来电/音频中断）后 analyser 读数是死的，
+ * 页面却仍显示"监测中"。这里每 5 秒检查一次状态：挂起就 resume，轨道 ended 就重开流。
+ * 只在 running 时生效，且同一时刻只跑一次恢复，避免反复 getUserMedia 把设备占死。 */
+var _wdLast=0, _wdBusy=false, _wdFail=0, _wdToastTs=0;
+function streamWatchdog(){
+  var now = Date.now();
+  if(now - _wdLast < 5000) return;
+  _wdLast = now;
+  if(_wdBusy) return;
+  if(audioCtx && audioCtx.state === "suspended"){
+    try{ audioCtx.resume(); }catch(e){}
+  }
+  if(streamAlive(combinedStream) && audioCtx && audioCtx.state === "running") { _wdFail = 0; return; }
+  if(!running) return;
+  if(_wdFail >= 3) return;     // 连续失败就停手，避免反复抢占麦克风/摄像头（等人工重开）
+  _wdBusy = true;
+  recoverStream().then(function(ok){
+    if(ok){ _wdFail = 0; }
+    else {
+      _wdFail++;
+      if(now - _wdToastTs > 300000 || _wdFail === 1){
+        _wdToastTs = now;
+        toast("⚠️麦克风/摄像头已中断，自动恢复失败（第"+_wdFail+"次），请手动重新开始监测");
+      }
+    }
+  }).catch(function(){}).then(function(){ _wdBusy = false; });
+}
+async function recoverStream(){
+  console.warn("[自愈] 采集链中断，重新获取媒体流");
+  var wasRecording = recording;
+  try{
+    if(wasRecording) await stopRecording();      // 旧流已死，先把录像会话正常收尾
+  }catch(e){}
+  resetAudioAnalysis();
+  try{
+    // ensureStream 会因 combinedStream 存在而直接返回，这里先清空再拉新流
+    if(combinedStream){ try{ combinedStream.getTracks().forEach(function(t){ try{ t.stop(); }catch(e){} }); }catch(e){} }
+    combinedStream = null;
+    var s = await ensureStream();
+    if(!streamAlive(s)) return false;
+    if(wasRecording){ try{ await startRecording(); }catch(e){} }
+    startRingRecording();                         // 录音段从头开始攒前摇
+    return true;
+  }catch(err){
+    console.warn("[自愈] 重新获取媒体流失败", err);
+    return false;
+  }
 }
 
 /* ---------- 绘制 ---------- */
@@ -1281,6 +1495,18 @@ function updateVideoStat(){
   $("videoStat").textContent=(recording?"录制中 ":"未录制 ")+segUploaded+" 段 · "+d+"s";
 }
 
+// 拆掉整条音频分析链（只碰音频，不动媒体流）
+function resetAudioAnalysis(){
+  if(audioCtx){ try{ audioCtx.close(); }catch(e){} }
+  audioCtx=null; analyser=null; micData=null;
+  // 一并解引用样本录音链节点：否则旧 AudioContext 的节点仍被全局引用，
+  // 再次启动时若建图失败，sampleDest 会指向一条已关闭的 destination
+  sampleSrc=null; sampleGain=null; sampleHp=null; sampleComp=null; sampleDest=null;
+  try{ if(peakWorklet && peakWorklet.disconnect) peakWorklet.disconnect(); }catch(e){}
+  try{ if(peakProc && peakProc.disconnect) peakProc.disconnect(); }catch(e){}
+  peakWorklet=null; peakWorkletSink=null; peakProc=null; peakMeterTried=false; fastPeakDb=0;
+}
+
 // 停止监测：释放摄像头/麦克风轨道，preview 停止出画面
 function releaseStream(){
   if(combinedStream){
@@ -1292,11 +1518,7 @@ function releaseStream(){
   soundLive = false;
   $("dSound").className = "dot";
   var st=$("sSound"); if(st){ st.textContent="已停止"; st.className="gstate"; }
-  if(audioCtx){ try{ audioCtx.close(); }catch(e){} }
-  audioCtx=null; analyser=null; micData=null;
-  // 一并解引用样本录音链节点：否则旧 AudioContext 的节点仍被全局引用，
-  // 再次启动时若建图失败，sampleDest 会指向一条已关闭的 destination
-  sampleSrc=null; sampleGain=null; sampleHp=null; sampleComp=null; sampleDest=null;
+  resetAudioAnalysis();
   gGauge.f=0; gGauge.c="#22D3EE"; gGauge.t="--";
   try{ drawArc($("gSound"),0,"#22D3EE","--"); }catch(e){}
 }
@@ -1471,6 +1693,7 @@ function auCellHtml(r){
       '<button type="button" class="au-btn au-ico" title="降噪清晰播放" onclick="playClearAudio(\''+js+'\',\''+dur+'\')">✨</button>';
   }
   if(r && r._uploadErr) return '<span style="color:#c00;font-size:11px">上传失败</span>';
+  if(r && r._noAudio) return '<span class="muted" title="检测到事件，但当时没有可用样本">无样本</span>';
   if(r && r.audio === "") return '<span class="muted">上传中…</span>';
   return '<span class="muted">—</span>';
 }
