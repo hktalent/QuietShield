@@ -432,11 +432,11 @@ def audio_path_from_url(url):
 
 # ---------------- 运行设置（持久化到 logs/settings.json） ----------------
 SETTINGS_FILE = os.path.join(LOG_DIR, "settings.json")
-DEFAULT_SETTINGS = {"audioBoost5x": False}
+DEFAULT_SETTINGS = {"audioBoost5x": True}
 
 
 def load_settings():
-    """读取运行设置；文件缺失/损坏时默认保留录音原始动态"""
+    """读取运行设置；文件缺失/损坏时返回默认值（录音保存默认放大 5 倍）"""
     data = {}
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -511,7 +511,7 @@ def normalize_audio_inplace(path):
         return False
     tmp = f"{path}.norm.{ext}"
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-           "-i", path, "-vn", "-c:a", "copy", tmp]
+           "-i", path, "-vn", "-c:a", codec[0], "-b:a", codec[1] or "96k", tmp]
     try:
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
         if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 200:
@@ -562,7 +562,7 @@ def trim_audio_inplace(path, start_ms, end_ms):
     tmp = f"{path}.trim.{ext}"
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
            "-i", path, "-ss", f"{keep_start:.3f}", "-to", f"{keep_end:.3f}",
-           "-map", "0:a", "-vn", "-c:a", "copy", tmp]
+           "-map", "0:a", "-vn", "-c:a", codec[0], "-b:a", codec[1] or "96k", tmp]
     try:
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
         if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 200:
