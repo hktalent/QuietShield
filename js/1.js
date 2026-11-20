@@ -145,6 +145,10 @@ var running=false;
 
 // 底噪自校准
 var noiseFloorDb = 30;
+// 本底自愈上爬状态：持续高于本底时缓慢抬高，避免本底被冻在低位（见 computeDb 内的说明）
+var floorRiseTs = 0, floorRiseBase = 0;
+// 持续噪声节流：连续被 MAX_SESSION_SEC 硬切后，一段时间内不再重复落样本（电平明显升高时才恢复）
+var sustainedHoldUntilTs = 0, sustainedLevel = 0, maxCutStreak = 0;
 var noiseFloorSamples = 0;
 var noiseFloorSum = 0;
 var noiseFloorCalSec = 2;   // 背景噪声校准时长(秒)，启动时按小时设置：凌晨 1-6 点 10s、白天 2s
@@ -275,8 +279,8 @@ function computeDb(){
   // 5分钟 dB 包络：用检测值（含区间峰值），节流期间漏掉的尖峰也能画出来
   envPush(Date.now(), DB.detect);
 
-  if(!overSession.active){
-    if(noiseFloorSamples < noiseFloorCalSec*10){
+  if(noiseFloorSamples < noiseFloorCalSec*10){
+    if(!overSession.active){
       calArr.push(db); noiseFloorSamples++;
       if(noiseFloorSamples === noiseFloorCalSec*10){
         // 背景代表值：凌晨安静→用中位数(抗偶发噪声)；白天→用平均值(常态噪声，避免平时噪声贴近触发线导致不回落)
@@ -287,16 +291,36 @@ function computeDb(){
         else { var _sum2=0; for(var _m2=0;_m2<_ca.length;_m2++) _sum2 += _ca[_m2]; _bv = _sum2/_ca.length; }
         noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, _bv));
       }
-    } else if(Date.now()-postSessionCooldownTs > POST_SESSION_COOLDOWN_MS && db < noiseFloorDb + 3){
+    }
+  } else if(db < noiseFloorDb + 3){
+    // 回到本底附近：按常规 EMA 跟踪（会话进行中不更新，避免把事件本身当成背景）
+    if(!overSession.active && Date.now()-postSessionCooldownTs > POST_SESSION_COOLDOWN_MS){
       noiseFloorDb = noiseFloorDb*(1-NOISE_FLOOR_ALPHA) + db*NOISE_FLOOR_ALPHA;
       noiseFloorDb = Math.max(MIN_NOISE_FLOOR, Math.min(MAX_NOISE_FLOOR, noiseFloorDb));
+    }
+    floorRiseTs = 0; floorRiseBase = 0;
+  } else {
+    /* 持续高于本底（房间一直有冰箱/风机/低频嗡声）：旧代码只在"安静且不在会话中"才更新本底，
+     * 于是本底被冻在低位 → 触发线永远够不着 → 一段刚被 MAX_SESSION_SEC 切掉就立刻重新触发，
+     * 变成每 60 秒一条（2026-11-20 03:16 起每分钟一条的根因）。
+     * 这里允许本底在「持续超线 FLOOR_RISE_HOLD_MS」之后缓慢上爬，每轮最多抬 FLOOR_RISE_MAX_DB，
+     * 且永远不超过当前电平 -3dB，避免把真实噪声事件本身算成背景。 */
+    var _fnow = Date.now();
+    if(!floorRiseTs){ floorRiseTs = _fnow; floorRiseBase = noiseFloorDb; }
+    else if(_fnow - floorRiseTs >= FLOOR_RISE_HOLD_MS){
+      var _fcap = Math.min(floorRiseBase + FLOOR_RISE_MAX_DB, db - 3, MAX_NOISE_FLOOR);
+      if(_fcap > noiseFloorDb){
+        var _fnew = noiseFloorDb*(1-FLOOR_RISE_ALPHA) + db*FLOOR_RISE_ALPHA;
+        noiseFloorDb = Math.min(_fcap, Math.max(noiseFloorDb, _fnew));
+      }
     }
   }
 }
 
 /* ===== 超标会话状态机（仅噪声，已去除磁/振快照） ===== */
-var overSession = { active:false, startTs:0, peakDb:0 };
-function resetOverSession(){ overSession.active=false; overSession.startTs=0; overSession.peakDb=0; if(typeof lastTrigTs !== "undefined") lastTrigTs=0; }
+var overSession = { active:false, startTs:0, peakDb:0, avgDb:0 };
+function resetOverSession(){ overSession.active=false; overSession.startTs=0; overSession.peakDb=0; overSession.avgDb=0; if(typeof lastTrigTs !== "undefined") lastTrigTs=0;
+  floorRiseTs=0; floorRiseBase=0; sustainedHoldUntilTs=0; sustainedLevel=0; maxCutStreak=0; }
 
 function formatFullTime(ts){
   var d=new Date(ts), p=function(n){return ("0"+n).slice(-2);};
@@ -726,6 +750,11 @@ const TRIG_HOLD_SEC = 0.15;   // 连续超触发线 0.15 秒（2 拍）才开记
 const IMPULSE_MARGIN_DB = 3;
 const MIN_RECORD_PEAK = 32;   // 只挡明显不是噪声的垃圾样本；旧值 39 会切掉一大批真实轻撞击
 const MAX_SESSION_SEC = 60;   // 连续噪声记录上限：最多 60 秒一段，超时切段重记（配合样本段硬上限 90 秒）
+const FLOOR_RISE_HOLD_MS = 10000;  // 持续超线满 10 秒才允许本底上爬（真实撞击只有 0.2~3 秒，不会误伤）
+const FLOOR_RISE_ALPHA = 0.002;    // 上爬步长（每 100ms 一拍，约 0.26dB/秒）
+const FLOOR_RISE_MAX_DB = 12;      // 单轮最多抬 12dB，防止把真正的强噪声当成背景
+const SUSTAIN_HOLD_MS = 300000;    // 连续噪声硬切后 5 分钟内不再重复落样本
+const SUSTAIN_RISE_DB = 6;         // 但电平比持续段高 6dB 以上时仍照常触发（不漏真事件）
 
 function setThr(){
   var h = new Date().getHours();
@@ -746,6 +775,9 @@ function processOverThreshold(currentDb){
                         : (early ? Math.min(thr, triggerLevel) : thr);
   if(!overSession.active){
     fallTs = null;
+    // 持续噪声节流：连续多段被 60 秒硬切（说明环境一直高于触发线）时，
+    // 5 分钟内不再重复落样本；只有电平比持续段高出 SUSTAIN_RISE_DB 才恢复触发，避免漏掉真事件。
+    if(nowTs < sustainedHoldUntilTs && currentDb < sustainedLevel + SUSTAIN_RISE_DB){ return; }
     var impulseLevel = trigLevel + IMPULSE_MARGIN_DB;
     var pass = currentDb > trigLevel;
     var impulse = currentDb >= impulseLevel;
@@ -758,19 +790,30 @@ function processOverThreshold(currentDb){
         overSession.active = true;
         overSession.startTs = trigPendingTs;
         overSession.peakDb = Math.max(trigPendingPeak, currentDb);
+        overSession.avgDb = overSession.peakDb;
         lastTrigTs = nowTs;
         trigPendingTs = 0; trigPendingPeak = 0;
       }
     } else { trigPendingTs = 0; trigPendingPeak = 0; }
   } else {
     var sessionDur = (nowTs - overSession.startTs)/1000;
-    if(sessionDur >= MAX_SESSION_SEC){ closeAndSaveSession(); return; }
+    if(sessionDur >= MAX_SESSION_SEC){
+      // 连续被硬切说明环境一直高于触发线（稳态嗡声 / 持续噪声），进入节流，别每分钟再落一条
+      maxCutStreak++;
+      if(maxCutStreak >= 2){
+        sustainedLevel = overSession.avgDb || overSession.peakDb;
+        sustainedHoldUntilTs = nowTs + SUSTAIN_HOLD_MS;
+      }
+      closeAndSaveSession(); return;
+    }
     if(currentDb > overSession.peakDb) overSession.peakDb = currentDb;
+    overSession.avgDb = overSession.avgDb + (currentDb - overSession.avgDb)*0.02;   // 慢速均值，用于判断"持续电平" 
     if(currentDb > trigLevel) lastTrigTs = nowTs;
     // 兜底：会话开着，但已经 SESSION_IDLE_CLOSE_SEC 秒没有任何一拍真正超过触发线，
     // 说明这段噪声已经结束（只是结束线定得太低够不着）。时长收在最后一次超线处，不虚增。
     if(lastTrigTs && (nowTs - lastTrigTs)/1000 >= SESSION_IDLE_CLOSE_SEC){
       if(fallTs === null) fallTs = lastTrigTs;
+      maxCutStreak = 0; sustainedHoldUntilTs = 0;   // 正常结束：解除持续噪声节流
       closeAndSaveSession();
       return;
     }
@@ -784,7 +827,7 @@ function processOverThreshold(currentDb){
     if(currentDb > releaseLevel){ fallTs=null; }
     else {
       if(fallTs===null) fallTs=nowTs;
-      else if((nowTs-fallTs)/1000 >= MERGE_GAP_SEC) closeAndSaveSession();
+      else if((nowTs-fallTs)/1000 >= MERGE_GAP_SEC){ maxCutStreak = 0; sustainedHoldUntilTs = 0; closeAndSaveSession(); }
     }
   }
   // 录像会话内同步记录峰值
